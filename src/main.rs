@@ -153,6 +153,10 @@ fn tool_notification(name: &str, args: &Value) -> String {
             let ver = args.get("version").and_then(|v| v.as_str()).unwrap_or("1.1");
             format!("Building SOAP {ver} envelope")
         }
+        "wsdl_inspect" => {
+            if let Some(f) = file { format!("Inspecting WSDL from {f}") }
+            else { "Inspecting WSDL".into() }
+        }
         _ => format!("Running {name}"),
     }
 }
@@ -323,6 +327,7 @@ const SOAP12_ENV: &str = "http://www.w3.org/2003/05/soap-envelope";
 const WSDL11_NS: &str = "http://schemas.xmlsoap.org/wsdl/";
 const SOAP11_BIND: &str = "http://schemas.xmlsoap.org/wsdl/soap/";
 const SOAP12_BIND: &str = "http://schemas.xmlsoap.org/wsdl/soap12/";
+#[allow(dead_code)]
 const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
 
 // ---------------------------------------------------------------------------
@@ -639,6 +644,444 @@ fn parse_body_fragments(xml: &str) -> Result<Vec<XmlElement>, String> {
     let wrapped = format!("<__wrapper__>{xml}</__wrapper__>");
     let wrapper = parse_xml_tree(&wrapped)?;
     Ok(wrapper.child_elements().cloned().collect())
+}
+
+// ---------------------------------------------------------------------------
+// WSDL types
+// ---------------------------------------------------------------------------
+
+struct WsdlOperation {
+    name: String,
+    input_message: String,
+    output_message: String,
+    soap_action: Option<String>,
+    style: Option<String>,
+}
+
+#[allow(dead_code)]
+struct WsdlPart {
+    name: String,
+    element: Option<String>,
+    type_name: Option<String>,
+}
+
+struct WsdlEndpoint {
+    name: String,
+    binding: String,
+    location: String,
+}
+
+struct WsdlTypeInfo {
+    name: String,
+    fields: Vec<WsdlField>,
+}
+
+#[allow(dead_code)]
+struct WsdlField {
+    name: String,
+    type_name: String,
+    min_occurs: String,
+    max_occurs: String,
+}
+
+// ---------------------------------------------------------------------------
+// wsdl_inspect
+// ---------------------------------------------------------------------------
+
+fn parse_wsdl_messages(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> HashMap<String, Vec<WsdlPart>> {
+    let mut messages = HashMap::new();
+    for msg_el in find_children_ns(root, WSDL11_NS, "message", ns_map) {
+        let name = msg_el.get_attribute("name").unwrap_or("").to_string();
+        let mut parts = Vec::new();
+        for part_el in find_children_ns(msg_el, WSDL11_NS, "part", ns_map) {
+            parts.push(WsdlPart {
+                name: part_el.get_attribute("name").unwrap_or("").to_string(),
+                element: part_el.get_attribute("element").map(|s| s.to_string()),
+                type_name: part_el.get_attribute("type").map(|s| s.to_string()),
+            });
+        }
+        messages.insert(name, parts);
+    }
+    messages
+}
+
+fn parse_wsdl_operations(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> Vec<WsdlOperation> {
+    let mut ops = Vec::new();
+    // Find portType operations for message refs
+    let mut port_type_ops: HashMap<String, (String, String)> = HashMap::new();
+    for pt in find_children_ns(root, WSDL11_NS, "portType", ns_map) {
+        for op in find_children_ns(pt, WSDL11_NS, "operation", ns_map) {
+            let name = op.get_attribute("name").unwrap_or("").to_string();
+            let input = find_child_ns(op, WSDL11_NS, "input", ns_map)
+                .and_then(|e| e.get_attribute("message"))
+                .unwrap_or("").to_string();
+            let output = find_child_ns(op, WSDL11_NS, "output", ns_map)
+                .and_then(|e| e.get_attribute("message"))
+                .unwrap_or("").to_string();
+            port_type_ops.insert(name, (strip_ns_prefix(&input), strip_ns_prefix(&output)));
+        }
+    }
+
+    // Find binding operations for SOAPAction and style
+    for binding in find_children_ns(root, WSDL11_NS, "binding", ns_map) {
+        // Detect SOAP binding style
+        let binding_style = binding.child_elements()
+            .find(|c| {
+                let local = local_name_of(&c.name);
+                local == "binding" && {
+                    let prefix = if let Some(idx) = c.name.find(':') { &c.name[..idx] } else { "" };
+                    ns_map.get(prefix).is_some_and(|&uri| uri == SOAP11_BIND || uri == SOAP12_BIND)
+                }
+            })
+            .and_then(|c| c.get_attribute("style"))
+            .map(|s| s.to_string());
+
+        for op_el in find_children_ns(binding, WSDL11_NS, "operation", ns_map) {
+            let name = op_el.get_attribute("name").unwrap_or("").to_string();
+            let soap_action = op_el.child_elements()
+                .find(|c| {
+                    let local = local_name_of(&c.name);
+                    local == "operation" && {
+                        let prefix = if let Some(idx) = c.name.find(':') { &c.name[..idx] } else { "" };
+                        ns_map.get(prefix).is_some_and(|&uri| uri == SOAP11_BIND || uri == SOAP12_BIND)
+                    }
+                })
+                .and_then(|c| c.get_attribute("soapAction"))
+                .map(|s| s.to_string());
+
+            let op_style = op_el.child_elements()
+                .find(|c| {
+                    let local = local_name_of(&c.name);
+                    local == "operation"
+                })
+                .and_then(|c| c.get_attribute("style"))
+                .map(|s| s.to_string())
+                .or_else(|| binding_style.clone());
+
+            let (input_msg, output_msg) = port_type_ops.get(&name)
+                .cloned()
+                .unwrap_or_default();
+
+            ops.push(WsdlOperation {
+                name,
+                input_message: input_msg,
+                output_message: output_msg,
+                soap_action,
+                style: op_style,
+            });
+        }
+    }
+    ops
+}
+
+fn parse_wsdl_endpoints(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> Vec<WsdlEndpoint> {
+    let mut endpoints = Vec::new();
+    for svc in find_children_ns(root, WSDL11_NS, "service", ns_map) {
+        for port in find_children_ns(svc, WSDL11_NS, "port", ns_map) {
+            let name = port.get_attribute("name").unwrap_or("").to_string();
+            let binding = strip_ns_prefix(port.get_attribute("binding").unwrap_or(""));
+            let location = port.child_elements()
+                .find(|c| {
+                    let local = local_name_of(&c.name);
+                    local == "address"
+                })
+                .and_then(|c| c.get_attribute("location"))
+                .unwrap_or("")
+                .to_string();
+            endpoints.push(WsdlEndpoint { name, binding, location });
+        }
+    }
+    endpoints
+}
+
+fn parse_wsdl_types(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> Vec<WsdlTypeInfo> {
+    let mut types = Vec::new();
+    let types_el = match find_child_ns(root, WSDL11_NS, "types", ns_map) {
+        Some(el) => el,
+        None => return types,
+    };
+
+    // Find XSD schemas within types
+    for schema_el in types_el.child_elements() {
+        let local = local_name_of(&schema_el.name);
+        if local != "schema" {
+            continue;
+        }
+        let schema_ns_map = build_ns_map(schema_el);
+        // Merge parent ns_map
+        let mut merged = ns_map.clone();
+        for (k, v) in &schema_ns_map {
+            merged.insert(k, v);
+        }
+
+        // Find elements and complexTypes
+        for child in schema_el.child_elements() {
+            let child_local = local_name_of(&child.name);
+            match child_local {
+                "element" => {
+                    let el_name = child.get_attribute("name").unwrap_or("").to_string();
+                    let fields = extract_xsd_fields(child, &merged);
+                    if !el_name.is_empty() {
+                        types.push(WsdlTypeInfo { name: el_name, fields });
+                    }
+                }
+                "complexType" => {
+                    let ct_name = child.get_attribute("name").unwrap_or("").to_string();
+                    let fields = extract_xsd_fields(child, &merged);
+                    if !ct_name.is_empty() {
+                        types.push(WsdlTypeInfo { name: ct_name, fields });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    types
+}
+
+fn extract_xsd_fields(el: &XmlElement, ns_map: &HashMap<&str, &str>) -> Vec<WsdlField> {
+    let mut fields = Vec::new();
+    // Look for sequence/all within complexType
+    for child in el.child_elements() {
+        let local = local_name_of(&child.name);
+        match local {
+            "complexType" => {
+                fields.extend(extract_xsd_fields(child, ns_map));
+            }
+            "sequence" | "all" | "choice" => {
+                for elem in child.child_elements() {
+                    let elem_local = local_name_of(&elem.name);
+                    if elem_local == "element" {
+                        let name = elem.get_attribute("name").unwrap_or("").to_string();
+                        let type_name = elem.get_attribute("type")
+                            .map(|t| strip_ns_prefix(t))
+                            .unwrap_or_default();
+                        let min_occurs = elem.get_attribute("minOccurs").unwrap_or("1").to_string();
+                        let max_occurs = elem.get_attribute("maxOccurs").unwrap_or("1").to_string();
+                        if !name.is_empty() {
+                            fields.push(WsdlField { name, type_name, min_occurs, max_occurs });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fields
+}
+
+fn strip_ns_prefix(s: &str) -> String {
+    if let Some(idx) = s.find(':') {
+        s[idx + 1..].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn resolve_message_to_type<'a>(
+    parts: &[WsdlPart],
+    types: &'a [WsdlTypeInfo],
+) -> Option<&'a WsdlTypeInfo> {
+    for part in parts {
+        if let Some(ref elem) = part.element {
+            let local = strip_ns_prefix(elem);
+            if let Some(t) = types.iter().find(|t| t.name == local) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+fn generate_sample_request(
+    op: &WsdlOperation,
+    messages: &HashMap<String, Vec<WsdlPart>>,
+    types: &[WsdlTypeInfo],
+    target_ns: &str,
+) -> String {
+    let parts = match messages.get(&op.input_message) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+
+    // Try to find the type info for the input message
+    let type_info = resolve_message_to_type(parts, types);
+    let elem_name = parts.first()
+        .and_then(|p| p.element.as_ref())
+        .map(|e| strip_ns_prefix(e))
+        .unwrap_or_else(|| op.input_message.clone());
+
+    let mut body = String::new();
+    if let Some(ti) = type_info {
+        body.push_str(&format!("    <{} xmlns=\"{target_ns}\">\n", elem_name));
+        for field in &ti.fields {
+            let sample = xsd_sample_value(&field.type_name);
+            body.push_str(&format!("      <{}>{}</{0}>\n", field.name, sample));
+        }
+        body.push_str(&format!("    </{elem_name}>\n"));
+    } else {
+        body.push_str(&format!("    <{} xmlns=\"{target_ns}\"/>\n", elem_name));
+    }
+
+    let mut out = String::with_capacity(512);
+    out.push_str("<?xml version=\"1.0\"?>\n");
+    out.push_str("<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\n");
+    out.push_str("  <soap:Body>\n");
+    out.push_str(&body);
+    out.push_str("  </soap:Body>\n");
+    out.push_str("</soap:Envelope>");
+    out
+}
+
+fn xsd_sample_value(type_name: &str) -> &'static str {
+    match type_name {
+        "string" => "string",
+        "int" | "integer" | "long" | "short" => "0",
+        "decimal" | "float" | "double" => "0.0",
+        "boolean" => "false",
+        "date" => "2024-01-01",
+        "dateTime" => "2024-01-01T00:00:00Z",
+        "time" => "00:00:00",
+        "base64Binary" => "base64data",
+        "hexBinary" => "0000",
+        "anyURI" => "http://example.com",
+        _ => "?",
+    }
+}
+
+fn wsdl_inspect(xml: &str) -> Result<String, String> {
+    let root = parse_xml_tree(xml)?;
+    let ns_map = build_ns_map(&root);
+
+    // Verify this is a WSDL document
+    let root_local = local_name_of(&root.name);
+    if root_local != "definitions" && root_local != "description" {
+        return Err(format!(
+            "Not a WSDL document: root element is <{}>, expected <definitions> or <description>.",
+            root.name
+        ));
+    }
+
+    let service_name = root.get_attribute("name").unwrap_or("(unnamed)");
+    let target_ns = root.get_attribute("targetNamespace").unwrap_or("");
+
+    let messages = parse_wsdl_messages(&root, &ns_map);
+    let operations = parse_wsdl_operations(&root, &ns_map);
+    let endpoints = parse_wsdl_endpoints(&root, &ns_map);
+    let types = parse_wsdl_types(&root, &ns_map);
+
+    // Detect SOAP binding style
+    let binding_style = operations.first()
+        .and_then(|op| op.style.as_deref())
+        .unwrap_or("document");
+
+    // Detect binding use (literal/encoded)
+    let binding_use = detect_binding_use(&root, &ns_map);
+
+    // Detect SOAP version from binding namespace
+    let soap_version = detect_wsdl_soap_version(&root, &ns_map);
+
+    let mut out = String::with_capacity(1024);
+    out.push_str(&format!("WSDL: {service_name}\n"));
+    out.push_str(&format!("Target namespace: {target_ns}\n"));
+    out.push_str(&format!("SOAP binding: {binding_style}/{binding_use}\n"));
+
+    // Operations
+    if !operations.is_empty() {
+        out.push_str(&format!("\nOperations ({}):\n", operations.len()));
+        for (i, op) in operations.iter().enumerate() {
+            out.push_str(&format!("  {}. {}\n", i + 1, op.name));
+            if let Some(ref action) = op.soap_action {
+                out.push_str(&format!("     SOAPAction: {action}\n"));
+            }
+            // Input description
+            if let Some(parts) = messages.get(&op.input_message) {
+                let desc = format_message_parts(parts, &types);
+                out.push_str(&format!("     Input:  {} {}\n", op.input_message, desc));
+            }
+            // Output description
+            if let Some(parts) = messages.get(&op.output_message) {
+                let desc = format_message_parts(parts, &types);
+                out.push_str(&format!("     Output: {} {}\n", op.output_message, desc));
+            }
+        }
+    }
+
+    // Endpoints
+    if !endpoints.is_empty() {
+        out.push_str(&format!("\nEndpoints:\n"));
+        for ep in &endpoints {
+            out.push_str(&format!("  - {} -> {}\n", ep.name, ep.location));
+            out.push_str(&format!("    Binding: {} (SOAP {})\n", ep.binding, soap_version));
+        }
+    }
+
+    // Sample request for first operation
+    if let Some(op) = operations.first() {
+        let sample = generate_sample_request(op, &messages, &types, target_ns);
+        if !sample.is_empty() {
+            out.push_str(&format!("\nSample request for {}:\n", op.name));
+            for line in sample.lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
+fn format_message_parts(parts: &[WsdlPart], types: &[WsdlTypeInfo]) -> String {
+    if let Some(ti) = resolve_message_to_type(parts, types) {
+        if ti.fields.is_empty() {
+            return String::new();
+        }
+        let fields: Vec<String> = ti.fields.iter()
+            .map(|f| format!("{}: {}", f.name, f.type_name))
+            .collect();
+        format!("({})", fields.join(", "))
+    } else {
+        String::new()
+    }
+}
+
+fn detect_binding_use(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> &'static str {
+    for binding in find_children_ns(root, WSDL11_NS, "binding", ns_map) {
+        for op in find_children_ns(binding, WSDL11_NS, "operation", ns_map) {
+            for child in op.child_elements() {
+                let local = local_name_of(&child.name);
+                if local == "input" || local == "output" {
+                    for body_el in child.child_elements() {
+                        if local_name_of(&body_el.name) == "body" {
+                            if let Some(use_val) = body_el.get_attribute("use") {
+                                return if use_val == "encoded" { "encoded" } else { "literal" };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    "literal"
+}
+
+fn detect_wsdl_soap_version(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> &'static str {
+    for binding in find_children_ns(root, WSDL11_NS, "binding", ns_map) {
+        for child in binding.child_elements() {
+            let local = local_name_of(&child.name);
+            if local == "binding" {
+                let prefix = if let Some(idx) = child.name.find(':') { &child.name[..idx] } else { "" };
+                if let Some(&uri) = ns_map.get(prefix) {
+                    if uri == SOAP12_BIND {
+                        return "1.2";
+                    }
+                    if uri == SOAP11_BIND {
+                        return "1.1";
+                    }
+                }
+            }
+        }
+    }
+    "1.1"
 }
 
 // ---------------------------------------------------------------------------
@@ -3780,6 +4223,32 @@ fn tool_definitions() -> &'static Value {
                         },
                         "required": ["body"]
                     }
+                },
+
+                // ═══════════════════════════════════════════════════════════════
+                // WSDL — Inspect web service definitions
+                // ═══════════════════════════════════════════════════════════════
+                {
+                    "name": "wsdl_inspect",
+                    "description": concat!(
+                        "Inspect a WSDL 1.1 document and summarize its services.\n\n",
+                        "INPUT: WSDL XML (inline or file)\n",
+                        "OUTPUT: Service name, operations, endpoints, types, and a sample SOAP request\n\n",
+                        "EXTRACTS:\n",
+                        "  - Service name and target namespace\n",
+                        "  - Operations with SOAPAction, input/output message types\n",
+                        "  - Endpoints with binding info and SOAP version\n",
+                        "  - XSD type fields for input/output messages\n",
+                        "  - Auto-generated sample SOAP request for the first operation\n\n",
+                        "USE FOR: Understanding web service APIs, generating SOAP requests, documentation."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "xml_data": { "type": "string", "description": "Inline WSDL XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to WSDL file" }
+                        }
+                    }
                 }
             ]
         })
@@ -4130,8 +4599,13 @@ fn handle_tool_call(params: &Value) -> Result<Value, String> {
             Ok(write_result_to_value(maybe_write_file(envelope, output_file)?, "xml"))
         }
 
+        "wsdl_inspect" => {
+            let xml = load_xml_str(&args, "xml_data", "xml_file")?;
+            wsdl_inspect(&xml).map(|s| text_result(&s))
+        }
+
         _ => Err(format!(
-            "Unknown tool: {name}. Available tools: xpath_query, xpath_set, xpath_delete, xpath_add, xml_to_json, json_to_xml, xml_format, xml_validate, xml_diff, xml_tree, xml_transform, schema_infer, schema_store, schema_get, schema_list, schema_delete, xml_generate, soap_parse, soap_build"
+            "Unknown tool: {name}. Available tools: xpath_query, xpath_set, xpath_delete, xpath_add, xml_to_json, json_to_xml, xml_format, xml_validate, xml_diff, xml_tree, xml_transform, schema_infer, schema_store, schema_get, schema_list, schema_delete, xml_generate, soap_parse, soap_build, wsdl_inspect"
         )),
     }
 }
@@ -4171,6 +4645,10 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                     "**SCHEMA**\n",
                     "- `schema_infer`: Learn structure from sample XML (use store_as to save)\n",
                     "- `xml_generate`: Create mock XML from stored schema\n\n",
+                    "**SOAP/WSDL**\n",
+                    "- `soap_parse`: Parse SOAP 1.1/1.2 envelopes → headers, body, faults\n",
+                    "- `soap_build`: Build SOAP envelopes from body XML + optional headers\n",
+                    "- `wsdl_inspect`: Inspect WSDL → operations, endpoints, types, sample requests\n\n",
                     "## XPath Quick Reference\n",
                     "- `//elem` → All elements named 'elem'\n",
                     "- `//elem/@attr` → Attribute values\n",
