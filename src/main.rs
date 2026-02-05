@@ -300,6 +300,12 @@ impl XmlElement {
     }
 }
 
+/// Extract local name from a potentially namespace-prefixed tag.
+/// "prefix:local" → "local", "local" → "local"
+fn local_name_of(s: &str) -> &str {
+    s.rsplit(':').next().unwrap_or(s)
+}
+
 // ---------------------------------------------------------------------------
 // XML parsing — quick-xml events → tree
 // ---------------------------------------------------------------------------
@@ -1683,7 +1689,7 @@ fn try_streaming_count(xml: &str, expr_str: &str) -> Option<usize> {
                 let name_bytes = e.name();
                 let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
                 // Handle namespace prefixes: match "ns:elem" or just "elem"
-                let local_name = tag.rsplit(':').next().unwrap_or(tag);
+                let local_name = local_name_of(tag);
 
                 if local_name == elem_name || elem_name == "*" {
                     // Check attribute filter if present
@@ -1754,12 +1760,12 @@ fn try_streaming_extract(xml: &str, expr_str: &str, limit: Option<usize>) -> Opt
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name_bytes = e.name();
                 let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
-                let local_name = tag.rsplit(':').next().unwrap_or(tag);
+                let local_name = local_name_of(tag);
 
                 if local_name == elem_name || elem_name == "*" {
                     for attr in e.attributes().flatten() {
                         let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                        let local_key = key.rsplit(':').next().unwrap_or(key);
+                        let local_key = local_name_of(key);
                         if local_key == attr_name {
                             if let Ok(val) = std::str::from_utf8(&attr.value) {
                                 values.push(val.to_string());
@@ -1837,7 +1843,7 @@ fn try_streaming_absolute_count(xml: &str, expr_str: &str) -> Option<usize> {
                 depth += 1;
                 let name_bytes = e.name();
                 let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
-                let local = tag.rsplit(':').next().unwrap_or(tag);
+                let local = local_name_of(tag);
 
                 if depth <= target_depth && matched_depth == depth - 1 && local == steps[depth - 1] {
                     matched_depth = depth;
@@ -1847,7 +1853,7 @@ fn try_streaming_absolute_count(xml: &str, expr_str: &str) -> Option<usize> {
                             Some(attr_name) => {
                                 if e.attributes().flatten().any(|a| {
                                     let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
-                                    key == attr_name || key.rsplit(':').next().unwrap_or(key) == attr_name
+                                    key == attr_name || local_name_of(key) == attr_name
                                 }) {
                                     count += 1;
                                 }
@@ -1860,7 +1866,7 @@ fn try_streaming_absolute_count(xml: &str, expr_str: &str) -> Option<usize> {
                 depth += 1;
                 let name_bytes = e.name();
                 let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
-                let local = tag.rsplit(':').next().unwrap_or(tag);
+                let local = local_name_of(tag);
 
                 if depth <= target_depth && matched_depth == depth - 1 && local == steps[depth - 1] {
                     if depth == target_depth {
@@ -1869,7 +1875,7 @@ fn try_streaming_absolute_count(xml: &str, expr_str: &str) -> Option<usize> {
                             Some(attr_name) => {
                                 if e.attributes().flatten().any(|a| {
                                     let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
-                                    key == attr_name || key.rsplit(':').next().unwrap_or(key) == attr_name
+                                    key == attr_name || local_name_of(key) == attr_name
                                 }) {
                                     count += 1;
                                 }
@@ -1914,7 +1920,7 @@ fn try_streaming_absolute_extract(xml: &str, expr_str: &str, limit: Option<usize
                 depth += 1;
                 let name_bytes = e.name();
                 let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
-                let local = tag.rsplit(':').next().unwrap_or(tag);
+                let local = local_name_of(tag);
 
                 if depth <= target_depth && matched_depth == depth - 1 && local == steps[depth - 1] {
                     matched_depth = depth;
@@ -1923,7 +1929,7 @@ fn try_streaming_absolute_extract(xml: &str, expr_str: &str, limit: Option<usize
                             // Extract attribute value
                             for a in e.attributes().flatten() {
                                 let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
-                                let local_key = key.rsplit(':').next().unwrap_or(key);
+                                let local_key = local_name_of(key);
                                 if local_key == attr_name {
                                     if let Ok(val) = std::str::from_utf8(&a.value) {
                                         values.push(val.to_string());
@@ -1945,14 +1951,14 @@ fn try_streaming_absolute_extract(xml: &str, expr_str: &str, limit: Option<usize
                 depth += 1;
                 let name_bytes = e.name();
                 let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
-                let local = tag.rsplit(':').next().unwrap_or(tag);
+                let local = local_name_of(tag);
 
                 if depth <= target_depth && matched_depth == depth - 1 && local == steps[depth - 1] {
                     if depth == target_depth {
                         if let Some(attr_name) = attr {
                             for a in e.attributes().flatten() {
                                 let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
-                                let local_key = key.rsplit(':').next().unwrap_or(key);
+                                let local_key = local_name_of(key);
                                 if local_key == attr_name {
                                     if let Ok(val) = std::str::from_utf8(&a.value) {
                                         values.push(val.to_string());
