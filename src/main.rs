@@ -151,7 +151,14 @@ fn tool_notification(name: &str, args: &Value) -> String {
         }
         "soap_build" => {
             let ver = args.get("version").and_then(|v| v.as_str()).unwrap_or("1.1");
-            format!("Building SOAP {ver} envelope")
+            let has_headers = args.get("headers").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+            let action_hint = args.get("action").and_then(|v| v.as_str());
+            let mut msg = format!("Building SOAP {ver} envelope");
+            if has_headers { msg.push_str(" with headers"); }
+            if let Some(act) = action_hint {
+                msg.push_str(&format!(" → {act}"));
+            }
+            msg
         }
         "wsdl_inspect" => {
             if let Some(f) = file { format!("Inspecting WSDL from {f}") }
@@ -548,14 +555,16 @@ fn soap_parse_envelope(xml: &str) -> Result<String, String> {
         let headers = parse_soap_headers(header_el);
         if !headers.is_empty() {
             out.push_str(&format!("\nHeaders ({}):\n", headers.len()));
-            for h in &headers {
-                let mu = if h.must_understand { " [mustUnderstand=true]" } else { "" };
-                out.push_str(&format!("  - {}{mu}\n", h.name));
+            for (i, h) in headers.iter().enumerate() {
+                let mut flags = Vec::new();
+                if h.must_understand { flags.push("mustUnderstand".to_string()); }
                 if let Some(ref actor) = h.actor {
-                    out.push_str(&format!("    Actor: {actor}\n"));
+                    flags.push(format!("actor={actor}"));
                 }
+                let bracket = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) };
+                out.push_str(&format!("  {}. {}{bracket}\n", i + 1, h.name));
                 for line in h.content.lines() {
-                    out.push_str(&format!("    {line}\n"));
+                    out.push_str(&format!("     {line}\n"));
                 }
             }
         }
@@ -1030,7 +1039,9 @@ fn wsdl_inspect(xml: &str) -> Result<String, String> {
         for (i, op) in operations.iter().enumerate() {
             out.push_str(&format!("  {}. {}\n", i + 1, op.name));
             if let Some(ref action) = op.soap_action {
-                out.push_str(&format!("     SOAPAction: {action}\n"));
+                if !action.is_empty() {
+                    out.push_str(&format!("     SOAPAction: {action}\n"));
+                }
             }
             // Input description
             if let Some(parts) = messages.get(&op.input_message) {
@@ -1049,8 +1060,8 @@ fn wsdl_inspect(xml: &str) -> Result<String, String> {
     if !endpoints.is_empty() {
         out.push_str(&format!("\nEndpoints:\n"));
         for ep in &endpoints {
-            out.push_str(&format!("  - {} -> {}\n", ep.name, ep.location));
-            out.push_str(&format!("    Binding: {} (SOAP {})\n", ep.binding, ep.soap_version));
+            out.push_str(&format!("  - {} → {}\n", ep.name, ep.location));
+            out.push_str(&format!("    {} (SOAP {}, {}/{})\n", ep.binding, ep.soap_version, binding_style, binding_use));
         }
     }
 
@@ -4207,37 +4218,49 @@ fn tool_definitions() -> &'static Value {
                 {
                     "name": "soap_parse",
                     "description": concat!(
-                        "Parse a SOAP 1.1/1.2 envelope into a human-readable summary.\n\n",
+                        "Parse a SOAP 1.1/1.2 envelope into a structured summary.\n\n",
                         "INPUT: SOAP XML (inline or file)\n",
                         "OUTPUT: Version, headers, body content, or fault details\n\n",
-                        "AUTO-DETECTS: SOAP 1.1 vs 1.2 from namespace URI\n",
-                        "SHOWS: Headers (with mustUnderstand), Body content, or Fault code/reason/detail\n\n",
-                        "USE FOR: Inspecting SOAP messages, debugging web service calls, analyzing faults."
+                        "AUTO-DETECTS: SOAP 1.1 vs 1.2 from envelope namespace URI\n\n",
+                        "OUTPUT FORMAT (normal):\n",
+                        "  SOAP 1.1 Envelope\n",
+                        "  Headers (N): name [mustUnderstand] [actor=URI]\n",
+                        "  Body: serialized child elements\n\n",
+                        "OUTPUT FORMAT (fault):\n",
+                        "  SOAP 1.1 FAULT\n",
+                        "  Code: soap:Client\n",
+                        "  Reason: error text\n",
+                        "  Detail: fault detail XML\n\n",
+                        "USE FOR: Inspecting SOAP responses, debugging web service calls, analyzing faults.\n",
+                        "SEE ALSO: soap_build (construct envelopes), wsdl_inspect (discover operations)"
                     ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline SOAP XML string" },
-                            "xml_file": { "type": "string", "description": "Absolute path to SOAP XML file" }
+                            "xml_data": { "type": "string", "description": "Inline SOAP XML string (the full <soap:Envelope>...</soap:Envelope>)" },
+                            "xml_file": { "type": "string", "description": "Path to SOAP XML file" }
                         }
                     }
                 },
                 {
                     "name": "soap_build",
                     "description": concat!(
-                        "Build a SOAP 1.1 or 1.2 envelope from body and optional headers.\n\n",
+                        "Build a SOAP 1.1 or 1.2 envelope from body XML and optional headers.\n\n",
                         "INPUT: Body XML (required), optional headers XML, version, SOAPAction\n",
                         "OUTPUT: Complete SOAP envelope with XML declaration\n\n",
-                        "VERSIONS: \"1.1\" (default), \"1.2\"\n\n",
-                        "USE FOR: Constructing SOAP requests, generating test payloads, prototyping web service calls."
+                        "VERSIONS: \"1.1\" (default) → http://schemas.xmlsoap.org/soap/envelope/\n",
+                        "          \"1.2\" → http://www.w3.org/2003/05/soap-envelope\n\n",
+                        "EXAMPLE body: '<GetPrice xmlns=\"http://example.com\"><item>ABC</item></GetPrice>'\n\n",
+                        "USE FOR: Constructing SOAP requests, generating test payloads, calling web services.\n",
+                        "SEE ALSO: wsdl_inspect (discover operations + sample requests), soap_parse (parse responses)"
                     ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "version": { "type": "string", "enum": ["1.1", "1.2"], "description": "SOAP version (default: 1.1)" },
-                            "body": { "type": "string", "description": "XML content for the SOAP Body (required)" },
-                            "headers": { "type": "string", "description": "XML content for the SOAP Header (optional)" },
-                            "action": { "type": "string", "description": "SOAPAction URI (included as comment)" },
+                            "body": { "type": "string", "description": "XML content for SOAP Body, e.g. '<MyOp xmlns=\"...\"><param>val</param></MyOp>'" },
+                            "headers": { "type": "string", "description": "XML content for SOAP Header, e.g. '<wsse:Security xmlns:wsse=\"...\">...</wsse:Security>'" },
+                            "action": { "type": "string", "description": "SOAPAction URI (included as XML comment), e.g. 'http://example.com/MyOp'" },
                             "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         },
                         "required": ["body"]
@@ -4252,20 +4275,23 @@ fn tool_definitions() -> &'static Value {
                     "description": concat!(
                         "Inspect a WSDL 1.1 document and summarize its services.\n\n",
                         "INPUT: WSDL XML (inline or file)\n",
-                        "OUTPUT: Service name, operations, endpoints, types, and a sample SOAP request\n\n",
-                        "EXTRACTS:\n",
-                        "  - Service name and target namespace\n",
-                        "  - Operations with SOAPAction, input/output message types\n",
-                        "  - Endpoints with binding info and SOAP version\n",
-                        "  - XSD type fields for input/output messages\n",
-                        "  - Auto-generated sample SOAP request for the first operation\n\n",
-                        "USE FOR: Understanding web service APIs, generating SOAP requests, documentation."
+                        "OUTPUT: Service name, operations, endpoints, types, sample SOAP request\n\n",
+                        "OUTPUT FORMAT:\n",
+                        "  WSDL: ServiceName\n",
+                        "  Operations (N): name, SOAPAction, input/output types with fields\n",
+                        "  Endpoints: port → URL (binding, SOAP version)\n",
+                        "  Sample request: ready-to-use SOAP envelope for first operation\n\n",
+                        "RESOLVES: XSD element→complexType references for field listing\n",
+                        "DEDUPLICATES: Operations across SOAP 1.1/1.2 dual bindings\n\n",
+                        "USE FOR: Discovering web service APIs, generating SOAP requests, API documentation.\n",
+                        "SEE ALSO: soap_build (construct requests), soap_parse (parse responses)\n",
+                        "WORKFLOW: wsdl_inspect → soap_build → [send] → soap_parse"
                     ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline WSDL XML string" },
-                            "xml_file": { "type": "string", "description": "Absolute path to WSDL file" }
+                            "xml_data": { "type": "string", "description": "Inline WSDL XML string (the full <wsdl:definitions>...</wsdl:definitions>)" },
+                            "xml_file": { "type": "string", "description": "Path to WSDL file" }
                         }
                     }
                 }
@@ -4667,7 +4693,8 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                     "**SOAP/WSDL**\n",
                     "- `soap_parse`: Parse SOAP 1.1/1.2 envelopes → headers, body, faults\n",
                     "- `soap_build`: Build SOAP envelopes from body XML + optional headers\n",
-                    "- `wsdl_inspect`: Inspect WSDL → operations, endpoints, types, sample requests\n\n",
+                    "- `wsdl_inspect`: Inspect WSDL → operations, endpoints, types, sample requests\n",
+                    "- Workflow: wsdl_inspect → soap_build → [send] → soap_parse\n\n",
                     "## XPath Quick Reference\n",
                     "- `//elem` → All elements named 'elem'\n",
                     "- `//elem/@attr` → Attribute values\n",
