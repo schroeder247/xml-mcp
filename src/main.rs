@@ -145,6 +145,14 @@ fn tool_notification(name: &str, args: &Value) -> String {
             let sn = args.get("schema_name").and_then(|v| v.as_str()).unwrap_or("?");
             format!("Generating XML from schema '{sn}'")
         }
+        "soap_parse" => {
+            if let Some(f) = file { format!("Parsing SOAP envelope from {f}") }
+            else { "Parsing SOAP envelope".into() }
+        }
+        "soap_build" => {
+            let ver = args.get("version").and_then(|v| v.as_str()).unwrap_or("1.1");
+            format!("Building SOAP {ver} envelope")
+        }
         _ => format!("Running {name}"),
     }
 }
@@ -304,6 +312,333 @@ impl XmlElement {
 /// "prefix:local" → "local", "local" → "local"
 fn local_name_of(s: &str) -> &str {
     s.rsplit(':').next().unwrap_or(s)
+}
+
+// ---------------------------------------------------------------------------
+// SOAP / WSDL namespace constants
+// ---------------------------------------------------------------------------
+
+const SOAP11_ENV: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+const SOAP12_ENV: &str = "http://www.w3.org/2003/05/soap-envelope";
+const WSDL11_NS: &str = "http://schemas.xmlsoap.org/wsdl/";
+const SOAP11_BIND: &str = "http://schemas.xmlsoap.org/wsdl/soap/";
+const SOAP12_BIND: &str = "http://schemas.xmlsoap.org/wsdl/soap12/";
+const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
+
+// ---------------------------------------------------------------------------
+// Namespace-aware helpers
+// ---------------------------------------------------------------------------
+
+/// Build a map of namespace prefix → URI from an element's attributes.
+/// Default namespace (xmlns="...") is keyed as "".
+fn build_ns_map(el: &XmlElement) -> HashMap<&str, &str> {
+    let mut map = HashMap::new();
+    for (key, val) in &el.attributes {
+        if key == "xmlns" {
+            map.insert("", val.as_str());
+        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
+            map.insert(prefix, val.as_str());
+        }
+    }
+    map
+}
+
+/// Check if an element matches a given namespace URI and local name.
+fn matches_ns(el: &XmlElement, ns: &str, local: &str, ns_map: &HashMap<&str, &str>) -> bool {
+    let el_local = local_name_of(&el.name);
+    if el_local != local {
+        return false;
+    }
+    let prefix = if let Some(idx) = el.name.find(':') { &el.name[..idx] } else { "" };
+    ns_map.get(prefix).is_some_and(|&uri| uri == ns)
+}
+
+/// Find the first child element matching namespace + local name.
+fn find_child_ns<'a>(
+    el: &'a XmlElement, ns: &str, local: &str, ns_map: &HashMap<&str, &str>,
+) -> Option<&'a XmlElement> {
+    el.child_elements().find(|c| matches_ns(c, ns, local, ns_map))
+}
+
+/// Find all child elements matching namespace + local name.
+fn find_children_ns<'a>(
+    el: &'a XmlElement, ns: &str, local: &str, ns_map: &HashMap<&str, &str>,
+) -> Vec<&'a XmlElement> {
+    el.child_elements().filter(|c| matches_ns(c, ns, local, ns_map)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// SOAP types
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum SoapVersion { V1_1, V1_2 }
+
+impl std::fmt::Display for SoapVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SoapVersion::V1_1 => f.write_str("1.1"),
+            SoapVersion::V1_2 => f.write_str("1.2"),
+        }
+    }
+}
+
+impl SoapVersion {
+    fn envelope_ns(self) -> &'static str {
+        match self {
+            SoapVersion::V1_1 => SOAP11_ENV,
+            SoapVersion::V1_2 => SOAP12_ENV,
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            SoapVersion::V1_1 => "soap",
+            SoapVersion::V1_2 => "soap12",
+        }
+    }
+}
+
+struct SoapHeader {
+    name: String,
+    must_understand: bool,
+    actor: Option<String>,
+    content: String,
+}
+
+struct SoapFault {
+    code: String,
+    reason: String,
+    detail: Option<String>,
+    #[allow(dead_code)]
+    node: Option<String>,
+    actor: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// soap_parse
+// ---------------------------------------------------------------------------
+
+fn detect_soap_version(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> Result<SoapVersion, String> {
+    let local = local_name_of(&root.name);
+    if local != "Envelope" {
+        return Err(format!(
+            "Not a SOAP envelope: root element is <{}>, expected <Envelope>.", root.name
+        ));
+    }
+    let prefix = if let Some(idx) = root.name.find(':') { &root.name[..idx] } else { "" };
+    match ns_map.get(prefix).copied() {
+        Some(SOAP11_ENV) => Ok(SoapVersion::V1_1),
+        Some(SOAP12_ENV) => Ok(SoapVersion::V1_2),
+        Some(other) => Err(format!(
+            "Unknown SOAP namespace: {other}. Expected SOAP 1.1 or 1.2."
+        )),
+        None => Err("No namespace found on Envelope element. Cannot determine SOAP version.".into()),
+    }
+}
+
+fn parse_soap_headers(header_el: &XmlElement) -> Vec<SoapHeader> {
+    let mut headers = Vec::new();
+    for child in header_el.child_elements() {
+        let must_understand = child.attributes.iter()
+            .find(|(k, _)| local_name_of(k) == "mustUnderstand")
+            .map(|(_, v)| v.as_str())
+            .is_some_and(|v| v == "1" || v == "true");
+        let actor = child.attributes.iter()
+            .find(|(k, _)| {
+                let l = local_name_of(k);
+                l == "actor" || l == "role"
+            })
+            .map(|(_, v)| v.to_string());
+        let content = serialize_element(child, true);
+        headers.push(SoapHeader {
+            name: child.name.clone(),
+            must_understand,
+            actor,
+            content,
+        });
+    }
+    headers
+}
+
+fn parse_soap11_fault(fault_el: &XmlElement) -> SoapFault {
+    let mut code = String::new();
+    let mut reason = String::new();
+    let mut detail = None;
+    let mut actor = None;
+    for child in fault_el.child_elements() {
+        let local = local_name_of(&child.name);
+        match local {
+            "faultcode" => code = child.text_content(),
+            "faultstring" => reason = child.text_content(),
+            "detail" => detail = Some(serialize_element(child, true)),
+            "faultactor" => actor = Some(child.text_content()),
+            _ => {}
+        }
+    }
+    SoapFault { code, reason, detail, node: None, actor }
+}
+
+fn parse_soap12_fault(fault_el: &XmlElement, ns_map: &HashMap<&str, &str>) -> SoapFault {
+    let env_ns = SOAP12_ENV;
+    let mut code = String::new();
+    let mut reason = String::new();
+    let mut detail = None;
+    let mut node = None;
+
+    if let Some(code_el) = find_child_ns(fault_el, env_ns, "Code", ns_map) {
+        if let Some(value_el) = find_child_ns(code_el, env_ns, "Value", ns_map) {
+            code = value_el.text_content();
+        }
+    }
+    if let Some(reason_el) = find_child_ns(fault_el, env_ns, "Reason", ns_map) {
+        if let Some(text_el) = find_child_ns(reason_el, env_ns, "Text", ns_map) {
+            reason = text_el.text_content();
+        }
+    }
+    if let Some(detail_el) = find_child_ns(fault_el, env_ns, "Detail", ns_map) {
+        detail = Some(serialize_element(detail_el, true));
+    }
+    if let Some(node_el) = find_child_ns(fault_el, env_ns, "Node", ns_map) {
+        node = Some(node_el.text_content());
+    }
+
+    SoapFault { code, reason, detail, node, actor: None }
+}
+
+fn soap_parse_envelope(xml: &str) -> Result<String, String> {
+    let root = parse_xml_tree(xml)?;
+    let ns_map = build_ns_map(&root);
+    let version = detect_soap_version(&root, &ns_map)?;
+    let env_ns = version.envelope_ns();
+
+    // Find Body (required)
+    let body = find_child_ns(&root, env_ns, "Body", &ns_map)
+        .ok_or("SOAP Envelope missing <Body> element.")?;
+
+    // Check for Fault
+    if let Some(fault_el) = find_child_ns(body, env_ns, "Fault", &ns_map) {
+        let fault = match version {
+            SoapVersion::V1_1 => parse_soap11_fault(fault_el),
+            SoapVersion::V1_2 => parse_soap12_fault(fault_el, &ns_map),
+        };
+        let mut out = String::with_capacity(256);
+        out.push_str(&format!("SOAP {} FAULT\n", version));
+        out.push_str(&format!("Code: {}\n", fault.code));
+        out.push_str(&format!("Reason: {}\n", fault.reason));
+        if let Some(ref actor) = fault.actor {
+            out.push_str(&format!("Actor: {actor}\n"));
+        }
+        if let Some(ref detail) = fault.detail {
+            out.push_str(&format!("Detail:\n{detail}\n"));
+        }
+        return Ok(out.trim_end().to_string());
+    }
+
+    let mut out = String::with_capacity(512);
+    out.push_str(&format!("SOAP {} Envelope\n", version));
+
+    // Headers (optional)
+    if let Some(header_el) = find_child_ns(&root, env_ns, "Header", &ns_map) {
+        let headers = parse_soap_headers(header_el);
+        if !headers.is_empty() {
+            out.push_str(&format!("\nHeaders ({}):\n", headers.len()));
+            for h in &headers {
+                let mu = if h.must_understand { " [mustUnderstand=true]" } else { "" };
+                out.push_str(&format!("  - {}{mu}\n", h.name));
+                if let Some(ref actor) = h.actor {
+                    out.push_str(&format!("    Actor: {actor}\n"));
+                }
+                for line in h.content.lines() {
+                    out.push_str(&format!("    {line}\n"));
+                }
+            }
+        }
+    }
+
+    // Body content
+    out.push_str("\nBody:\n");
+    for child in body.child_elements() {
+        let serialized = serialize_element(child, true);
+        for line in serialized.lines() {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// soap_build
+// ---------------------------------------------------------------------------
+
+fn soap_build_envelope(
+    version: SoapVersion,
+    body_xml: &str,
+    headers_xml: Option<&str>,
+    action: Option<&str>,
+) -> Result<String, String> {
+    let prefix = version.prefix();
+    let env_ns = version.envelope_ns();
+
+    // Parse body content
+    let body_children = parse_body_fragments(body_xml)
+        .map_err(|e| format!("Invalid body XML: {e}"))?;
+
+    let env_attrs = vec![
+        (format!("xmlns:{prefix}"), env_ns.to_string()),
+    ];
+    let mut env_children: Vec<XmlChild> = Vec::new();
+
+    // Add action as comment if provided
+    if let Some(act) = action {
+        env_children.push(XmlChild::Comment(format!(" SOAPAction: {act} ")));
+    }
+
+    // Optional header
+    if let Some(hdr_xml) = headers_xml {
+        let hdr_children = parse_body_fragments(hdr_xml)
+            .map_err(|e| format!("Invalid headers XML: {e}"))?;
+        if !hdr_children.is_empty() {
+            let header_el = XmlElement {
+                name: format!("{prefix}:Header"),
+                attributes: vec![],
+                children: hdr_children.into_iter().map(XmlChild::Element).collect(),
+            };
+            env_children.push(XmlChild::Element(header_el));
+        }
+    }
+
+    // Body
+    let body_el = XmlElement {
+        name: format!("{prefix}:Body"),
+        attributes: vec![],
+        children: body_children.into_iter().map(XmlChild::Element).collect(),
+    };
+    env_children.push(XmlChild::Element(body_el));
+
+    let envelope = XmlElement {
+        name: format!("{prefix}:Envelope"),
+        attributes: env_attrs,
+        children: env_children,
+    };
+
+    let mut out = String::with_capacity(512);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    write_element(&envelope, 0, true, &mut out);
+    Ok(out.trim_end().to_string())
+}
+
+/// Parse XML string that may contain one or more root-level elements.
+fn parse_body_fragments(xml: &str) -> Result<Vec<XmlElement>, String> {
+    // Try parsing as-is first (single root)
+    if let Ok(el) = parse_xml_tree(xml) {
+        return Ok(vec![el]);
+    }
+    // Wrap in temporary root for multiple fragments
+    let wrapped = format!("<__wrapper__>{xml}</__wrapper__>");
+    let wrapper = parse_xml_tree(&wrapped)?;
+    Ok(wrapper.child_elements().cloned().collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -3402,6 +3737,49 @@ fn tool_definitions() -> &'static Value {
                         },
                         "required": ["schema_name"]
                     }
+                },
+
+                // ═══════════════════════════════════════════════════════════════
+                // SOAP — Parse and build SOAP envelopes
+                // ═══════════════════════════════════════════════════════════════
+                {
+                    "name": "soap_parse",
+                    "description": concat!(
+                        "Parse a SOAP 1.1/1.2 envelope into a human-readable summary.\n\n",
+                        "INPUT: SOAP XML (inline or file)\n",
+                        "OUTPUT: Version, headers, body content, or fault details\n\n",
+                        "AUTO-DETECTS: SOAP 1.1 vs 1.2 from namespace URI\n",
+                        "SHOWS: Headers (with mustUnderstand), Body content, or Fault code/reason/detail\n\n",
+                        "USE FOR: Inspecting SOAP messages, debugging web service calls, analyzing faults."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "xml_data": { "type": "string", "description": "Inline SOAP XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to SOAP XML file" }
+                        }
+                    }
+                },
+                {
+                    "name": "soap_build",
+                    "description": concat!(
+                        "Build a SOAP 1.1 or 1.2 envelope from body and optional headers.\n\n",
+                        "INPUT: Body XML (required), optional headers XML, version, SOAPAction\n",
+                        "OUTPUT: Complete SOAP envelope with XML declaration\n\n",
+                        "VERSIONS: \"1.1\" (default), \"1.2\"\n\n",
+                        "USE FOR: Constructing SOAP requests, generating test payloads, prototyping web service calls."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "version": { "type": "string", "enum": ["1.1", "1.2"], "description": "SOAP version (default: 1.1)" },
+                            "body": { "type": "string", "description": "XML content for the SOAP Body (required)" },
+                            "headers": { "type": "string", "description": "XML content for the SOAP Header (optional)" },
+                            "action": { "type": "string", "description": "SOAPAction URI (included as comment)" },
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
+                        },
+                        "required": ["body"]
+                    }
                 }
             ]
         })
@@ -3733,8 +4111,27 @@ fn handle_tool_call(params: &Value) -> Result<Value, String> {
             Ok(write_result_to_value(maybe_write_file(xml, output_file)?, "xml"))
         }
 
+        "soap_parse" => {
+            let xml = load_xml_str(&args, "xml_data", "xml_file")?;
+            soap_parse_envelope(&xml).map(|s| text_result(&s))
+        }
+
+        "soap_build" => {
+            let body = args.get("body").and_then(|v| v.as_str())
+                .ok_or("Missing required parameter 'body'.")?;
+            let version = match args.get("version").and_then(|v| v.as_str()) {
+                Some("1.2") => SoapVersion::V1_2,
+                _ => SoapVersion::V1_1,
+            };
+            let headers = args.get("headers").and_then(|v| v.as_str());
+            let action = args.get("action").and_then(|v| v.as_str());
+            let output_file = args.get("output_file").and_then(|v| v.as_str());
+            let envelope = soap_build_envelope(version, body, headers, action)?;
+            Ok(write_result_to_value(maybe_write_file(envelope, output_file)?, "xml"))
+        }
+
         _ => Err(format!(
-            "Unknown tool: {name}. Available tools: xpath_query, xpath_set, xpath_delete, xpath_add, xml_to_json, json_to_xml, xml_format, xml_validate, xml_diff, xml_tree, xml_transform, schema_infer, schema_store, schema_get, schema_list, schema_delete, xml_generate"
+            "Unknown tool: {name}. Available tools: xpath_query, xpath_set, xpath_delete, xpath_add, xml_to_json, json_to_xml, xml_format, xml_validate, xml_diff, xml_tree, xml_transform, schema_infer, schema_store, schema_get, schema_list, schema_delete, xml_generate, soap_parse, soap_build"
         )),
     }
 }
