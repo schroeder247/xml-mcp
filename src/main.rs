@@ -1522,6 +1522,168 @@ enum XPathMatch {
     Value(String),
 }
 
+// ---------------------------------------------------------------------------
+// Streaming XPath optimization for large files
+// ---------------------------------------------------------------------------
+
+/// Fast streaming count for patterns like count(//elem) or count(//elem[@attr])
+/// Returns Some(count) if pattern can be optimized, None to fall back to DOM
+fn try_streaming_count(xml: &str, expr_str: &str) -> Option<usize> {
+    let expr = expr_str.trim();
+
+    // Match count(//name) or count(//name[@attr]) patterns
+    if !expr.starts_with("count(") || !expr.ends_with(')') {
+        return None;
+    }
+
+    let inner = expr[6..expr.len()-1].trim();
+
+    // Pattern: //name or //name[@attr='val'] or //name[@attr]
+    if !inner.starts_with("//") {
+        return None;
+    }
+
+    let path = &inner[2..];
+
+    // Extract element name and optional attribute filter
+    let (elem_name, attr_filter): (&str, Option<(&str, Option<&str>)>) =
+        if let Some(bracket_pos) = path.find('[') {
+            let name = &path[..bracket_pos];
+            let predicate = &path[bracket_pos+1..path.len()-1]; // strip [ ]
+
+            // Parse [@attr] or [@attr='value'] or [@attr="value"]
+            if predicate.starts_with('@') {
+                let attr_part = &predicate[1..];
+                if let Some(eq_pos) = attr_part.find('=') {
+                    let attr_name = &attr_part[..eq_pos];
+                    let val = attr_part[eq_pos+1..].trim();
+                    // Strip quotes
+                    let val = if (val.starts_with('\'') && val.ends_with('\'')) ||
+                                (val.starts_with('"') && val.ends_with('"')) {
+                        Some(&val[1..val.len()-1])
+                    } else {
+                        return None; // Invalid syntax
+                    };
+                    (name, Some((attr_name, val)))
+                } else {
+                    (attr_part, Some((attr_part, None))) // [@attr] - just check existence
+                }
+            } else {
+                return None; // Non-attribute predicate, fall back to DOM
+            }
+        } else {
+            (path, None)
+        };
+
+    // Validate element name (simple names only)
+    if elem_name.is_empty() || elem_name.contains('/') || elem_name.contains('[') {
+        return None;
+    }
+
+    // Stream count using quick-xml
+    let mut reader = Reader::from_str(xml);
+    let mut count = 0;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name_bytes = e.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
+                // Handle namespace prefixes: match "ns:elem" or just "elem"
+                let local_name = tag.rsplit(':').next().unwrap_or(tag);
+
+                if local_name == elem_name || elem_name == "*" {
+                    // Check attribute filter if present
+                    let matches = match attr_filter {
+                        None => true,
+                        Some((attr_name, None)) => {
+                            // Just check attribute exists
+                            e.attributes().flatten().any(|a| {
+                                let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
+                                key == attr_name || key.ends_with(&format!(":{attr_name}"))
+                            })
+                        }
+                        Some((attr_name, Some(attr_val))) => {
+                            // Check attribute value matches
+                            e.attributes().flatten().any(|a| {
+                                let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
+                                let val = std::str::from_utf8(&a.value).unwrap_or("");
+                                (key == attr_name || key.ends_with(&format!(":{attr_name}"))) && val == attr_val
+                            })
+                        }
+                    };
+                    if matches {
+                        count += 1;
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None, // Parse error, fall back to DOM
+            _ => {}
+        }
+    }
+
+    Some(count)
+}
+
+/// Fast streaming extraction for simple patterns like //elem/@attr
+/// Returns Some(values) if optimizable, None to fall back to DOM
+fn try_streaming_extract(xml: &str, expr_str: &str) -> Option<Vec<String>> {
+    let expr = expr_str.trim();
+
+    // Pattern: //name/@attr
+    if !expr.starts_with("//") {
+        return None;
+    }
+
+    let path = &expr[2..];
+
+    // Must have exactly one /@attr at the end
+    let parts: Vec<&str> = path.rsplitn(2, "/@").collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let attr_name = parts[0];
+    let elem_name = parts[1];
+
+    // Validate: simple element name, simple attribute name
+    if elem_name.is_empty() || elem_name.contains('/') || elem_name.contains('[') ||
+       attr_name.is_empty() || attr_name.contains('/') || attr_name.contains('[') {
+        return None;
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut values = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name_bytes = e.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
+                let local_name = tag.rsplit(':').next().unwrap_or(tag);
+
+                if local_name == elem_name || elem_name == "*" {
+                    for attr in e.attributes().flatten() {
+                        let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
+                        let local_key = key.rsplit(':').next().unwrap_or(key);
+                        if local_key == attr_name {
+                            if let Ok(val) = std::str::from_utf8(&attr.value) {
+                                values.push(val.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    Some(values)
+}
+
 fn xpath_query_tree(root: &XmlElement, expr_str: &str) -> Result<(Vec<XPathMatch>, XValue), String> {
     let expr = parse_xpath_expr(expr_str)?;
     let arena = Arena::build(root);
@@ -2437,115 +2599,209 @@ fn tool_definitions() -> &'static Value {
     TOOL_DEFS.get_or_init(|| {
         json!({
             "tools": [
+                // ═══════════════════════════════════════════════════════════════
+                // XPATH QUERY & MODIFY — Primary XML manipulation tools
+                // ═══════════════════════════════════════════════════════════════
                 {
                     "name": "xpath_query",
-                    "description": "Query XML with XPath 1.0. Returns elements/attributes/text. Axes: child|descendant|parent|ancestor|sibling. Predicates: [N], [@a='v'], [f()]. Functions: count|sum|contains|starts-with|substring|concat|normalize-space|not|position|last.",
+                    "description": concat!(
+                        "Extract data from XML using XPath 1.0 expressions.\n\n",
+                        "INPUT: XML (inline or file) + XPath expression\n",
+                        "OUTPUT: Matched values, elements, or count\n\n",
+                        "COMMON PATTERNS:\n",
+                        "  //elem/@attr      → Get attribute from all matching elements\n",
+                        "  //elem/text()     → Get text content\n",
+                        "  //elem[@id='x']   → Filter by attribute value\n",
+                        "  count(//elem)     → Count elements (streaming, fast on large files)\n",
+                        "  //parent/child    → Navigate hierarchy\n\n",
+                        "AXES: child, descendant, parent, ancestor, following-sibling, preceding-sibling\n",
+                        "FUNCTIONS: count, sum, contains, starts-with, substring, concat, not, position, last\n\n",
+                        "USE FOR: Data extraction, element counting, attribute lookup, validation queries."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" },
-                            "expression": { "type": "string", "description": "XPath: /root/child, //elem, @attr, text(), [@id='1']" }
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
+                            "expression": { "type": "string", "description": "XPath expression. Examples: //book/@title, count(//item), //user[@active='true']" }
                         },
                         "required": ["expression"]
                     }
                 },
                 {
                     "name": "xpath_set",
-                    "description": "Set value at XPath matches. Modifies element text, attribute values, or creates attributes.",
+                    "description": concat!(
+                        "Modify values at XPath-matched locations.\n\n",
+                        "INPUT: XML + XPath + new value\n",
+                        "OUTPUT: Modified XML (inline or written to file)\n\n",
+                        "MODIFIES:\n",
+                        "  //elem/@attr      → Update attribute value\n",
+                        "  //elem/text()     → Update element text content\n",
+                        "  //elem            → Replace element's text\n\n",
+                        "USE FOR: Bulk updates, config changes, attribute modifications."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" },
-                            "expression": { "type": "string", "description": "XPath selecting nodes" },
-                            "value": { "type": "string", "description": "New value" },
-                            "output_file": { "type": "string", "description": "Write to file instead of inline" }
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
+                            "expression": { "type": "string", "description": "XPath selecting nodes to modify" },
+                            "value": { "type": "string", "description": "New value to set" },
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         },
                         "required": ["expression", "value"]
                     }
                 },
                 {
                     "name": "xpath_delete",
-                    "description": "Delete nodes at XPath matches. Removes elements, attributes, or text.",
+                    "description": concat!(
+                        "Remove nodes matching XPath expression.\n\n",
+                        "INPUT: XML + XPath\n",
+                        "OUTPUT: XML with matched nodes removed\n\n",
+                        "DELETES: Elements, attributes, text nodes\n\n",
+                        "EXAMPLES:\n",
+                        "  //comment()       → Remove all comments\n",
+                        "  //temp            → Remove all <temp> elements\n",
+                        "  //@debug          → Remove debug attributes\n\n",
+                        "USE FOR: Cleanup, removing deprecated elements, stripping metadata."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" },
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
                             "expression": { "type": "string", "description": "XPath selecting nodes to delete" },
-                            "output_file": { "type": "string", "description": "Write to file instead of inline" }
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         },
                         "required": ["expression"]
                     }
                 },
                 {
                     "name": "xpath_add",
-                    "description": "Insert element or attribute at XPath targets. Position: inside|before|after. Content: '<elem>val</elem>' or '@attr=val'.",
+                    "description": concat!(
+                        "Insert elements or attributes at XPath-matched locations.\n\n",
+                        "INPUT: XML + XPath + content + position\n",
+                        "OUTPUT: XML with new content inserted\n\n",
+                        "POSITIONS:\n",
+                        "  inside (default)  → Append as last child\n",
+                        "  before            → Insert before matched element\n",
+                        "  after             → Insert after matched element\n\n",
+                        "CONTENT FORMATS:\n",
+                        "  <elem>text</elem> → Insert element\n",
+                        "  @attr=value       → Add attribute to matched elements\n\n",
+                        "USE FOR: Adding new elements, setting attributes, document augmentation."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" },
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
                             "expression": { "type": "string", "description": "XPath selecting target elements" },
-                            "content": { "type": "string", "description": "'<elem>val</elem>' or '@attr=val'" },
+                            "content": { "type": "string", "description": "Content to insert: '<elem>text</elem>' or '@attr=value'" },
                             "position": { "type": "string", "enum": ["inside", "before", "after"], "description": "Insert position (default: inside)" },
-                            "output_file": { "type": "string", "description": "Write to file instead of inline" }
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         },
                         "required": ["expression", "content"]
                     }
                 },
+
+                // ═══════════════════════════════════════════════════════════════
+                // FORMAT CONVERSION — XML ↔ JSON
+                // ═══════════════════════════════════════════════════════════════
                 {
                     "name": "xml_to_json",
-                    "description": "Convert XML→JSON. @attr→'@attr', text→'#text', repeated→array.",
+                    "description": concat!(
+                        "Convert XML to JSON with consistent mapping.\n\n",
+                        "INPUT: XML (inline or file)\n",
+                        "OUTPUT: JSON object\n\n",
+                        "MAPPING RULES:\n",
+                        "  <elem attr=\"v\">  → {\"elem\": {\"@attr\": \"v\", ...}}\n",
+                        "  <elem>text</elem> → {\"elem\": \"text\"} or {\"elem\": {\"#text\": \"text\"}}\n",
+                        "  repeated <elem>   → {\"elem\": [...]}\n\n",
+                        "USE FOR: Processing XML with JSON tools, data interchange, API integration."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" }
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" }
                         }
                     }
                 },
                 {
                     "name": "json_to_xml",
-                    "description": "Convert JSON→XML. '@key'→attr, '#text'→text, array→repeated elements.",
+                    "description": concat!(
+                        "Convert JSON to XML with consistent mapping.\n\n",
+                        "INPUT: JSON (inline or file)\n",
+                        "OUTPUT: XML document\n\n",
+                        "MAPPING RULES:\n",
+                        "  {\"@attr\": \"v\"}   → attr=\"v\"\n",
+                        "  {\"#text\": \"t\"}   → text content\n",
+                        "  {\"elem\": [...]}   → repeated <elem> elements\n\n",
+                        "USE FOR: Generating XML from structured data, roundtrip with xml_to_json."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "json_data": { "type": "string", "description": "Inline JSON" },
-                            "json_file": { "type": "string", "description": "Path to JSON file" },
-                            "root_element": { "type": "string", "description": "Root element name (if JSON has multiple keys)" },
-                            "output_file": { "type": "string", "description": "Write to file instead of inline" }
+                            "json_data": { "type": "string", "description": "Inline JSON string" },
+                            "json_file": { "type": "string", "description": "Absolute path to JSON file" },
+                            "root_element": { "type": "string", "description": "Root element name (required if JSON has multiple top-level keys)" },
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         }
                     }
                 },
-                {
-                    "name": "xml_format",
-                    "description": "Reformat XML. Modes: pretty (indented), compact (minified), sorted (alphabetized attrs).",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" },
-                            "mode": { "type": "string", "enum": ["pretty", "compact", "sorted"], "description": "Format mode (default: pretty)" },
-                            "output_file": { "type": "string", "description": "Write to file instead of inline" }
-                        }
-                    }
-                },
+
+                // ═══════════════════════════════════════════════════════════════
+                // ANALYSIS & VALIDATION
+                // ═══════════════════════════════════════════════════════════════
                 {
                     "name": "xml_validate",
-                    "description": "Check XML well-formedness. Returns root element info or parse error.",
+                    "description": concat!(
+                        "Check XML well-formedness (not schema validation).\n\n",
+                        "INPUT: XML (inline or file)\n",
+                        "OUTPUT: Parse status, root element info, or error details\n\n",
+                        "USE FOR: Validating generated XML, checking file integrity, debugging parse errors."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" }
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" }
+                        }
+                    }
+                },
+                {
+                    "name": "xml_tree",
+                    "description": concat!(
+                        "Display XML structure as an indented tree.\n\n",
+                        "INPUT: XML (inline or file)\n",
+                        "OUTPUT: Tree view showing elements, attributes, content types\n\n",
+                        "FORMAT:\n",
+                        "  <element> [@attr1, @attr2] : text\n",
+                        "    <child> [@id]\n\n",
+                        "USE FOR: Understanding document structure, exploring unfamiliar XML, documentation."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
+                            "max_depth": { "type": "integer", "description": "Maximum tree depth to display (default: unlimited)" }
                         }
                     }
                 },
                 {
                     "name": "xml_diff",
-                    "description": "Compare two XML docs. Reports added/removed/changed elements, attributes, text with paths.",
+                    "description": concat!(
+                        "Compare two XML documents and report differences.\n\n",
+                        "INPUT: Two XML documents (inline or files)\n",
+                        "OUTPUT: List of differences with XPath locations\n\n",
+                        "REPORTS:\n",
+                        "  + /path/elem      → Element added\n",
+                        "  - /path/elem      → Element removed\n",
+                        "  ~ /path/@attr     → Value changed: old → new\n\n",
+                        "USE FOR: Version comparison, change detection, config drift analysis."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2557,51 +2813,82 @@ fn tool_definitions() -> &'static Value {
                     }
                 },
                 {
-                    "name": "xml_tree",
-                    "description": "Show XML structure as indented tree with element names, [@attrs], content types.",
+                    "name": "xml_format",
+                    "description": concat!(
+                        "Reformat XML with different styles.\n\n",
+                        "INPUT: XML (inline or file) + format mode\n",
+                        "OUTPUT: Reformatted XML\n\n",
+                        "MODES:\n",
+                        "  pretty (default)  → Indented, human-readable\n",
+                        "  compact           → Minified, no whitespace\n",
+                        "  sorted            → Pretty + attributes alphabetized\n\n",
+                        "USE FOR: Normalizing for comparison, minifying for transmission, beautifying."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" },
-                            "max_depth": { "type": "integer", "description": "Max depth (default: unlimited)" }
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
+                            "mode": { "type": "string", "enum": ["pretty", "compact", "sorted"], "description": "Format mode (default: pretty)" },
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         }
                     }
                 },
+
+                // ═══════════════════════════════════════════════════════════════
+                // TRANSFORMATION
+                // ═══════════════════════════════════════════════════════════════
                 {
                     "name": "xml_transform",
-                    "description": "Apply XSLT stylesheet. Requires xsltproc installed.",
+                    "description": concat!(
+                        "Apply XSLT 1.0 stylesheet to transform XML.\n\n",
+                        "INPUT: XML + XSLT stylesheet\n",
+                        "OUTPUT: Transformed result (XML, HTML, text, etc.)\n\n",
+                        "REQUIRES: xsltproc installed on system\n\n",
+                        "USE FOR: Complex transformations, XML→HTML, report generation, format conversion."
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" },
-                            "xslt_data": { "type": "string", "description": "Inline XSLT" },
-                            "xslt_file": { "type": "string", "description": "Path to XSLT file" },
-                            "output_file": { "type": "string", "description": "Write to file instead of inline" }
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
+                            "xslt_data": { "type": "string", "description": "Inline XSLT stylesheet" },
+                            "xslt_file": { "type": "string", "description": "Absolute path to XSLT file" },
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         }
                     }
                 },
+
+                // ═══════════════════════════════════════════════════════════════
+                // SCHEMA — Infer, store, and use XML structure schemas
+                // ═══════════════════════════════════════════════════════════════
                 {
                     "name": "schema_infer",
-                    "description": "Infer structure schema from XML. Captures elements, attrs, children, text. Use store_as to save.",
+                    "description": concat!(
+                        "Analyze XML and infer its structure schema.\n\n",
+                        "INPUT: XML (inline or file)\n",
+                        "OUTPUT: JSON schema describing element hierarchy, attributes, types\n\n",
+                        "CAPTURES: Element names, attribute names/types, child relationships, text content\n\n",
+                        "USE FOR: Understanding structure, generating mock data, documentation.\n",
+                        "SEE ALSO: schema_store (save), xml_generate (create from schema)"
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "xml_data": { "type": "string", "description": "Inline XML" },
-                            "xml_file": { "type": "string", "description": "Path to XML file" },
-                            "store_as": { "type": "string", "description": "Save schema with this name" }
+                            "xml_data": { "type": "string", "description": "Inline XML string" },
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
+                            "store_as": { "type": "string", "description": "Save inferred schema with this name" }
                         }
                     }
                 },
                 {
                     "name": "schema_store",
-                    "description": "Save schema by name to ~/.config/xml-mcp/schemas/.",
+                    "description": "Save a schema by name to ~/.config/xml-mcp/schemas/ for later use.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "name": { "type": "string", "description": "Schema name" },
-                            "schema": { "type": "string", "description": "Schema JSON string" },
+                            "name": { "type": "string", "description": "Schema name (e.g., 'maven-pom', 'svg-icon')" },
+                            "schema": { "type": "string", "description": "Schema as JSON string" },
                             "schema_file": { "type": "string", "description": "Path to schema JSON file" }
                         },
                         "required": ["name"]
@@ -2609,7 +2896,7 @@ fn tool_definitions() -> &'static Value {
                 },
                 {
                     "name": "schema_get",
-                    "description": "Get stored schema by name.",
+                    "description": "Retrieve a stored schema by name.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2620,28 +2907,35 @@ fn tool_definitions() -> &'static Value {
                 },
                 {
                     "name": "schema_list",
-                    "description": "List stored schemas with summaries.",
+                    "description": "List all stored schemas with element summaries.",
                     "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "schema_delete",
-                    "description": "Delete stored schema by name.",
+                    "description": "Delete a stored schema by name.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "name": { "type": "string", "description": "Schema name" }
+                            "name": { "type": "string", "description": "Schema name to delete" }
                         },
                         "required": ["name"]
                     }
                 },
                 {
                     "name": "xml_generate",
-                    "description": "Generate XML from stored schema with field-aware mock data (emails, IDs, dates, URLs).",
+                    "description": concat!(
+                        "Generate sample XML from a stored schema.\n\n",
+                        "INPUT: Schema name\n",
+                        "OUTPUT: Valid XML with realistic mock data\n\n",
+                        "GENERATES: Field-appropriate values (emails, IDs, dates, URLs based on field names)\n\n",
+                        "USE FOR: Test data, prototyping, documentation examples.\n",
+                        "SEE ALSO: schema_infer (create schema from sample XML)"
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "schema_name": { "type": "string", "description": "Stored schema name" },
-                            "output_file": { "type": "string", "description": "Write to file instead of inline" }
+                            "schema_name": { "type": "string", "description": "Stored schema name (use schema_list to see available)" },
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         },
                         "required": ["schema_name"]
                     }
@@ -2720,6 +3014,27 @@ fn handle_tool_call(params: &Value) -> Result<Value, String> {
             let xml = load_xml_str(&args, "xml_data", "xml_file")?;
             let expr = args.get("expression").and_then(|v| v.as_str())
                 .ok_or("Missing 'expression'")?;
+
+            // Try streaming optimizations first (much faster for large files)
+            if let Some(count) = try_streaming_count(&xml, expr) {
+                return Ok(text_result(&count.to_string()));
+            }
+            if let Some(values) = try_streaming_extract(&xml, expr) {
+                if values.is_empty() {
+                    return Ok(text_result("0 matches"));
+                } else if values.len() == 1 {
+                    return Ok(text_result(&values[0]));
+                } else {
+                    let mut out = format!("{}\n", values.len());
+                    for v in &values {
+                        out.push_str(v);
+                        out.push('\n');
+                    }
+                    return Ok(text_result(out.trim_end()));
+                }
+            }
+
+            // Fall back to full DOM-based XPath evaluation
             let root = parse_xml_tree(&xml)?;
             let (results, _xvalue) = xpath_query_tree(&root, expr)?;
             if results.is_empty() {
@@ -2949,7 +3264,39 @@ fn handle_request(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {}, "logging": {} },
-                "serverInfo": { "name": "xml-mcp", "version": env!("CARGO_PKG_VERSION") }
+                "serverInfo": { "name": "xml-mcp", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": concat!(
+                    "# xml-mcp: XML Processing Server\n\n",
+                    "## Quick Reference\n\n",
+                    "**QUERYING (Read Operations)**\n",
+                    "- `xpath_query`: Extract data with XPath → //elem/@attr, count(//elem), //elem[@id='x']\n",
+                    "- `xml_tree`: Visualize structure → Fast overview of unfamiliar XML\n",
+                    "- `xml_validate`: Check well-formedness → Parse status or error details\n\n",
+                    "**MODIFYING (Write Operations)**\n",
+                    "- `xpath_set`: Update values → //elem/@attr, //elem/text()\n",
+                    "- `xpath_add`: Insert elements/attrs → position: inside|before|after\n",
+                    "- `xpath_delete`: Remove nodes → //comment(), //@debug, //temp\n\n",
+                    "**CONVERSION**\n",
+                    "- `xml_to_json`: XML→JSON (attrs become @attr, text becomes #text)\n",
+                    "- `json_to_xml`: JSON→XML (roundtrip compatible)\n",
+                    "- `xml_transform`: XSLT 1.0 transformation (requires xsltproc)\n\n",
+                    "**COMPARISON**\n",
+                    "- `xml_diff`: Compare two documents → Shows +added/-removed/~changed with paths\n",
+                    "- `xml_format`: Normalize → pretty|compact|sorted modes\n\n",
+                    "**SCHEMA**\n",
+                    "- `schema_infer`: Learn structure from sample XML (use store_as to save)\n",
+                    "- `xml_generate`: Create mock XML from stored schema\n\n",
+                    "## XPath Quick Reference\n",
+                    "- `//elem` → All elements named 'elem'\n",
+                    "- `//elem/@attr` → Attribute values\n",
+                    "- `//elem[@id='x']` → Filter by attribute\n",
+                    "- `//parent/child` → Direct children\n",
+                    "- `count(//elem)` → Count (streaming, fast on large files)\n\n",
+                    "## Tips\n",
+                    "- count() and //elem/@attr queries use streaming (fast on large files)\n",
+                    "- Complex XPath builds full DOM (slower on 10MB+ files)\n",
+                    "- Schemas persist to ~/.config/xml-mcp/schemas/"
+                )
             }),
         ),
         "tools/list" => JsonRpcResponse::ok(id, tool_definitions().clone()),
