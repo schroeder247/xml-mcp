@@ -262,6 +262,7 @@ enum XmlChild {
 }
 
 impl XmlElement {
+    /// Returns text content, trimmed. Avoids intermediate allocations.
     fn text_content(&self) -> String {
         let mut s = String::new();
         for child in &self.children {
@@ -270,17 +271,32 @@ impl XmlElement {
                 _ => {}
             }
         }
-        s.trim().to_string()
+        // Trim in-place by finding bounds, then truncating
+        let trimmed = s.trim();
+        if trimmed.len() == s.len() {
+            s
+        } else {
+            trimmed.to_string()
+        }
     }
 
-    fn child_elements(&self) -> Vec<&XmlElement> {
-        self.children.iter().filter_map(|c| {
-            if let XmlChild::Element(el) = c { Some(el) } else { None }
-        }).collect()
+    /// Returns iterator over child elements (avoids Vec allocation)
+    fn child_elements(&self) -> impl Iterator<Item = &XmlElement> {
+        self.children.iter().filter_map(|c| match c {
+            XmlChild::Element(el) => Some(el),
+            _ => None,
+        })
+    }
+
+    /// Returns count of child elements without allocating
+    fn child_element_count(&self) -> usize {
+        self.children.iter().filter(|c| matches!(c, XmlChild::Element(_))).count()
     }
 
     fn get_attribute(&self, name: &str) -> Option<&str> {
-        self.attributes.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        self.attributes.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -384,19 +400,52 @@ fn read_attributes(e: &BytesStart) -> Result<Vec<(String, String)>, String> {
 // XML serialization — tree → string
 // ---------------------------------------------------------------------------
 
-fn escape_xml_text(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+/// Escape XML text content - single pass, no intermediate allocations
+fn escape_xml_text(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>')) {
+        let mut out = String::with_capacity(s.len() + 8);
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                _ => out.push(c),
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
-fn escape_xml_attr(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+/// Escape XML attribute value - single pass, no intermediate allocations
+fn escape_xml_attr(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"')) {
+        let mut out = String::with_capacity(s.len() + 8);
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                _ => out.push(c),
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
 fn write_element(element: &XmlElement, indent: usize, pretty: bool, out: &mut String) {
-    let prefix = if pretty { " ".repeat(indent) } else { String::new() };
-    let nl = if pretty { "\n" } else { "" };
+    // Write indent
+    if pretty {
+        for _ in 0..indent {
+            out.push(' ');
+        }
+    }
 
-    out.push_str(&prefix);
+    // Opening tag
     out.push('<');
     out.push_str(&element.name);
     for (k, v) in &element.attributes {
@@ -409,7 +458,7 @@ fn write_element(element: &XmlElement, indent: usize, pretty: bool, out: &mut St
 
     if element.children.is_empty() {
         out.push_str("/>");
-        out.push_str(nl);
+        if pretty { out.push('\n'); }
         return;
     }
 
@@ -418,7 +467,7 @@ fn write_element(element: &XmlElement, indent: usize, pretty: bool, out: &mut St
     let has_element_children = element.children.iter().any(|c| matches!(c, XmlChild::Element(_)));
 
     if has_element_children && pretty {
-        out.push_str(nl);
+        out.push('\n');
     }
 
     for child in &element.children {
@@ -432,24 +481,27 @@ fn write_element(element: &XmlElement, indent: usize, pretty: bool, out: &mut St
             }
             XmlChild::Comment(c) => {
                 if pretty {
-                    out.push_str(&prefix);
-                    out.push_str("  ");
+                    for _ in 0..indent + 2 {
+                        out.push(' ');
+                    }
                 }
                 out.push_str("<!--");
                 out.push_str(c);
                 out.push_str("-->");
-                out.push_str(nl);
+                if pretty { out.push('\n'); }
             }
         }
     }
 
     if has_element_children && pretty {
-        out.push_str(&prefix);
+        for _ in 0..indent {
+            out.push(' ');
+        }
     }
     out.push_str("</");
     out.push_str(&element.name);
     out.push('>');
-    out.push_str(nl);
+    if pretty { out.push('\n'); }
 }
 
 fn serialize_element(element: &XmlElement, pretty: bool) -> String {
@@ -476,20 +528,29 @@ enum Tok {
 fn is_name_start(c: char) -> bool { c.is_ascii_alphabetic() || c == '_' }
 fn is_name_char(c: char) -> bool { c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') }
 
+/// Tokenize XPath expression - works directly on &str to avoid Vec<char> allocation
 fn tokenize_xpath(input: &str) -> Result<Vec<Tok>, String> {
-    let ch: Vec<char> = input.chars().collect();
-    let mut toks: Vec<Tok> = Vec::new();
+    let bytes = input.as_bytes();
+    let mut toks: Vec<Tok> = Vec::with_capacity(16); // Pre-allocate for typical expressions
     let mut i = 0;
-    while i < ch.len() {
-        if ch[i].is_whitespace() { i += 1; continue; }
-        match ch[i] {
-            '/' if i + 1 < ch.len() && ch[i+1] == '/' => { toks.push(Tok::DSlash); i += 2; }
+
+    // Helper to get char at byte position (ASCII-safe for XPath syntax)
+    let char_at = |pos: usize| -> Option<char> {
+        bytes.get(pos).map(|&b| b as char)
+    };
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_whitespace() { i += 1; continue; }
+
+        match c {
+            '/' if char_at(i + 1) == Some('/') => { toks.push(Tok::DSlash); i += 2; }
             '/' => { toks.push(Tok::Slash); i += 1; }
-            '.' if i + 1 < ch.len() && ch[i+1] == '.' => { toks.push(Tok::DDot); i += 2; }
-            '.' if i + 1 < ch.len() && ch[i+1].is_ascii_digit() => {
+            '.' if char_at(i + 1) == Some('.') => { toks.push(Tok::DDot); i += 2; }
+            '.' if char_at(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
                 let s = i; i += 1;
-                while i < ch.len() && ch[i].is_ascii_digit() { i += 1; }
-                let n: String = ch[s..i].iter().collect();
+                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() { i += 1; }
+                let n = &input[s..i];
                 toks.push(Tok::Num(n.parse().map_err(|_| format!("Bad number: {n}"))?));
             }
             '.' => { toks.push(Tok::Dot); i += 1; }
@@ -504,55 +565,55 @@ fn tokenize_xpath(input: &str) -> Result<Vec<Tok>, String> {
             '+' => { toks.push(Tok::Plus); i += 1; }
             '-' => { toks.push(Tok::Minus); i += 1; }
             '=' => { toks.push(Tok::Eq); i += 1; }
-            '!' if i + 1 < ch.len() && ch[i+1] == '=' => { toks.push(Tok::Ne); i += 2; }
-            '<' if i + 1 < ch.len() && ch[i+1] == '=' => { toks.push(Tok::Le); i += 2; }
+            '!' if char_at(i + 1) == Some('=') => { toks.push(Tok::Ne); i += 2; }
+            '<' if char_at(i + 1) == Some('=') => { toks.push(Tok::Le); i += 2; }
             '<' => { toks.push(Tok::Lt); i += 1; }
-            '>' if i + 1 < ch.len() && ch[i+1] == '=' => { toks.push(Tok::Ge); i += 2; }
+            '>' if char_at(i + 1) == Some('=') => { toks.push(Tok::Ge); i += 2; }
             '>' => { toks.push(Tok::Gt); i += 1; }
             q @ ('\'' | '"') => {
-                i += 1; let s = i;
-                while i < ch.len() && ch[i] != q { i += 1; }
-                if i >= ch.len() { return Err("Unterminated string".into()); }
-                toks.push(Tok::Str(ch[s..i].iter().collect()));
+                i += 1;
+                let s = i;
+                while i < bytes.len() && bytes[i] as char != q { i += 1; }
+                if i >= bytes.len() { return Err("Unterminated string".into()); }
+                toks.push(Tok::Str(input[s..i].to_string()));
                 i += 1;
             }
             c if c.is_ascii_digit() => {
                 let s = i;
-                while i < ch.len() && (ch[i].is_ascii_digit() || ch[i] == '.') { i += 1; }
-                let n: String = ch[s..i].iter().collect();
+                while i < bytes.len() && matches!(bytes[i] as char, '0'..='9' | '.') { i += 1; }
+                let n = &input[s..i];
                 toks.push(Tok::Num(n.parse().map_err(|_| format!("Bad number: {n}"))?));
             }
             c if is_name_start(c) => {
                 let s = i;
-                while i < ch.len() && is_name_char(ch[i]) { i += 1; }
-                if i < ch.len() && ch[i] == ':' && i + 1 < ch.len() && ch[i+1] == ':' {
+                while i < bytes.len() && is_name_char(bytes[i] as char) { i += 1; }
+                if char_at(i) == Some(':') && char_at(i + 1) == Some(':') {
                     // axis::
-                    let name: String = ch[s..i].iter().collect();
-                    toks.push(Tok::Name(name));
-                    toks.push(Tok::DColon); i += 2;
-                } else if i < ch.len() && ch[i] == ':' && i + 1 < ch.len()
-                          && (is_name_start(ch[i+1]) || ch[i+1] == '*') {
+                    toks.push(Tok::Name(input[s..i].to_string()));
+                    toks.push(Tok::DColon);
+                    i += 2;
+                } else if char_at(i) == Some(':') && char_at(i + 1).is_some_and(|c| is_name_start(c) || c == '*') {
                     // namespace prefix
                     i += 1;
-                    if ch[i] == '*' { i += 1; }
-                    else { while i < ch.len() && is_name_char(ch[i]) { i += 1; } }
-                    toks.push(Tok::Name(ch[s..i].iter().collect()));
+                    if bytes[i] as char == '*' { i += 1; }
+                    else { while i < bytes.len() && is_name_char(bytes[i] as char) { i += 1; } }
+                    toks.push(Tok::Name(input[s..i].to_string()));
                 } else {
-                    let name: String = ch[s..i].iter().collect();
+                    let name = &input[s..i];
                     let is_op = toks.last().is_some_and(|t| matches!(t,
                         Tok::RBrack | Tok::RParen | Tok::Str(_) | Tok::Num(_) |
                         Tok::Name(_) | Tok::Star | Tok::Dot | Tok::DDot
                     ));
                     if is_op {
-                        match name.as_str() {
+                        match name {
                             "and" => toks.push(Tok::And),
                             "or" => toks.push(Tok::Or),
                             "div" => toks.push(Tok::Div),
                             "mod" => toks.push(Tok::Mod),
-                            _ => toks.push(Tok::Name(name)),
+                            _ => toks.push(Tok::Name(name.to_string())),
                         }
                     } else {
-                        toks.push(Tok::Name(name));
+                        toks.push(Tok::Name(name.to_string()));
                     }
                 }
             }
@@ -1960,7 +2021,7 @@ fn xpath_add_tree(root: &mut XmlElement, expr_str: &str, xml_content: &str, posi
 // ---------------------------------------------------------------------------
 
 fn element_to_json(element: &XmlElement) -> Value {
-    let child_elements = element.child_elements();
+    let child_elements: Vec<_> = element.child_elements().collect();
     let text = element.text_content();
     let has_text = !text.is_empty();
 
@@ -2185,25 +2246,26 @@ fn write_tree_node(elem: &XmlElement, depth: usize, max_depth: Option<usize>, ou
         line.push_str(&format!(" [{}]", attrs.join(", ")));
     }
 
-    // Count children
-    let child_elems = elem.child_elements();
+    // Check content types
     let has_text = !elem.text_content().is_empty();
     let has_cdata = elem.children.iter().any(|c| matches!(c, XmlChild::CData(_)));
     let has_comment = elem.children.iter().any(|c| matches!(c, XmlChild::Comment(_)));
+    let child_count = elem.child_element_count();
 
-    let mut content_parts: Vec<String> = Vec::new();
-    if has_text { content_parts.push("text".into()); }
-    if has_cdata { content_parts.push("CDATA".into()); }
-    if has_comment { content_parts.push("comment".into()); }
-    if child_elems.is_empty() && !content_parts.is_empty() {
-        line.push_str(&format!(" : {}", content_parts.join(", ")));
+    let mut content_parts: Vec<&str> = Vec::new();
+    if has_text { content_parts.push("text"); }
+    if has_cdata { content_parts.push("CDATA"); }
+    if has_comment { content_parts.push("comment"); }
+    if child_count == 0 && !content_parts.is_empty() {
+        line.push_str(" : ");
+        line.push_str(&content_parts.join(", "));
     }
 
     out.push_str(&line);
     out.push('\n');
 
     // Recurse into children
-    for child in &child_elems {
+    for child in elem.child_elements() {
         write_tree_node(child, depth + 1, max_depth, out);
     }
 }
@@ -2215,7 +2277,7 @@ fn write_tree_node(elem: &XmlElement, depth: usize, max_depth: Option<usize>, ou
 fn validate_xml(xml: &str) -> Result<String, String> {
     match parse_xml_tree(xml) {
         Ok(root) => {
-            let child_count = root.child_elements().len();
+            let child_count = root.child_element_count();
             let attr_count = root.attributes.len();
             Ok(format!(
                 "Valid XML. Root element: <{}> ({} attribute(s), {} child element(s))",
@@ -2359,8 +2421,8 @@ fn diff_xml_trees(a: &XmlElement, b: &XmlElement, path: &str, diffs: &mut Vec<Xm
     }
 
     // Compare child elements by name groups
-    let a_children = a.child_elements();
-    let b_children = b.child_elements();
+    let a_children: Vec<_> = a.child_elements().collect();
+    let b_children: Vec<_> = b.child_elements().collect();
 
     // Group children by name, preserving order
     let mut a_groups: HashMap<&str, Vec<&XmlElement>> = HashMap::new();
@@ -2432,7 +2494,7 @@ fn infer_xml_schema(element: &XmlElement) -> Value {
     }
 
     // Children
-    let child_elements = element.child_elements();
+    let child_elements: Vec<_> = element.child_elements().collect();
     if !child_elements.is_empty() {
         let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
