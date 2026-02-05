@@ -909,8 +909,40 @@ impl XParser {
     }
 }
 
+/// Decode XML entities that LLMs often send in XPath expressions.
+/// Single-pass decoder for &lt; &gt; &amp; &quot; &apos;
+fn decode_xpath_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    let bytes = input.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if input[i..].starts_with("&lt;") {
+                out.push('<'); i += 4;
+            } else if input[i..].starts_with("&gt;") {
+                out.push('>'); i += 4;
+            } else if input[i..].starts_with("&amp;") {
+                out.push('&'); i += 5;
+            } else if input[i..].starts_with("&quot;") {
+                out.push('"'); i += 6;
+            } else if input[i..].starts_with("&apos;") {
+                out.push('\''); i += 6;
+            } else {
+                out.push('&'); i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char); i += 1;
+        }
+    }
+    out
+}
+
 fn parse_xpath_expr(input: &str) -> Result<Expr, String> {
-    let toks = tokenize_xpath(input)?;
+    let decoded = decode_xpath_entities(input);
+    let toks = tokenize_xpath(&decoded)?;
     if toks.is_empty() { return Err("Empty XPath expression".into()); }
     let mut parser = XParser::new(toks);
     parser.parse()
@@ -1689,7 +1721,7 @@ fn try_streaming_count(xml: &str, expr_str: &str) -> Option<usize> {
 
 /// Fast streaming extraction for simple patterns like //elem/@attr
 /// Returns Some(values) if optimizable, None to fall back to DOM
-fn try_streaming_extract(xml: &str, expr_str: &str) -> Option<Vec<String>> {
+fn try_streaming_extract(xml: &str, expr_str: &str, limit: Option<usize>) -> Option<Vec<String>> {
     let expr = expr_str.trim();
 
     // Pattern: //name/@attr
@@ -1734,7 +1766,241 @@ fn try_streaming_extract(xml: &str, expr_str: &str) -> Option<Vec<String>> {
                             }
                         }
                     }
+                    if limit.is_some_and(|lim| values.len() >= lim) {
+                        return Some(values);
+                    }
                 }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    Some(values)
+}
+
+/// Parse a simple absolute path like /a/b/c or /a/b/@attr into steps.
+/// Returns None for complex expressions (predicates, wildcards, etc.)
+fn parse_simple_absolute_path(path: &str) -> Option<(Vec<&str>, Option<&str>)> {
+    let path = path.trim();
+    if !path.starts_with('/') || path.starts_with("//") || path.contains('[') || path.contains('(') || path.contains('*') {
+        return None;
+    }
+    let path = &path[1..]; // strip leading /
+    if path.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+
+    // Check if last part is @attr
+    if let Some(last) = parts.last() {
+        if let Some(attr) = last.strip_prefix('@') {
+            if attr.is_empty() || attr.contains('/') {
+                return None;
+            }
+            let elem_steps: Vec<&str> = parts[..parts.len() - 1].to_vec();
+            if elem_steps.is_empty() {
+                return None;
+            }
+            return Some((elem_steps, Some(attr)));
+        }
+    }
+
+    Some((parts, None))
+}
+
+/// Fast streaming count for absolute path patterns like count(/a/b/c).
+fn try_streaming_absolute_count(xml: &str, expr_str: &str) -> Option<usize> {
+    let expr = expr_str.trim();
+    if !expr.starts_with("count(") || !expr.ends_with(')') {
+        return None;
+    }
+    let inner = expr[6..expr.len()-1].trim();
+    let (steps, attr) = parse_simple_absolute_path(inner)?;
+
+    // For attribute paths, count elements that have the attribute
+    let target_depth = steps.len(); // depth 1 = root element
+    let mut reader = Reader::from_str(xml);
+    let mut depth: usize = 0;
+    let mut count = 0;
+    // Track which steps we've matched: path_depth[i] = true if step i matched at this depth
+    let mut matched_depth: usize = 0; // how many steps matched so far
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                depth += 1;
+                let name_bytes = e.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
+                let local = tag.rsplit(':').next().unwrap_or(tag);
+
+                if depth <= target_depth && matched_depth == depth - 1 && local == steps[depth - 1] {
+                    matched_depth = depth;
+                    if depth == target_depth {
+                        match attr {
+                            None => count += 1,
+                            Some(attr_name) => {
+                                if e.attributes().flatten().any(|a| {
+                                    let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
+                                    key == attr_name || key.rsplit(':').next().unwrap_or(key) == attr_name
+                                }) {
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                depth += 1;
+                let name_bytes = e.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
+                let local = tag.rsplit(':').next().unwrap_or(tag);
+
+                if depth <= target_depth && matched_depth == depth - 1 && local == steps[depth - 1] {
+                    if depth == target_depth {
+                        match attr {
+                            None => count += 1,
+                            Some(attr_name) => {
+                                if e.attributes().flatten().any(|a| {
+                                    let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
+                                    key == attr_name || key.rsplit(':').next().unwrap_or(key) == attr_name
+                                }) {
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                depth -= 1;
+            }
+            Ok(Event::End(_)) => {
+                if matched_depth >= depth {
+                    matched_depth = depth - 1;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    Some(count)
+}
+
+/// Fast streaming extraction for absolute path patterns like /a/b/c or /a/b/@attr.
+/// Honors limit for early termination.
+fn try_streaming_absolute_extract(xml: &str, expr_str: &str, limit: Option<usize>) -> Option<Vec<String>> {
+    let (steps, attr) = parse_simple_absolute_path(expr_str)?;
+    let target_depth = steps.len();
+
+    let mut reader = Reader::from_str(xml);
+    let mut depth: usize = 0;
+    let mut matched_depth: usize = 0;
+    let mut values = Vec::new();
+    // For text extraction: track if we're inside a matched target element
+    let mut capturing = false;
+    let mut captured_text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                depth += 1;
+                let name_bytes = e.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
+                let local = tag.rsplit(':').next().unwrap_or(tag);
+
+                if depth <= target_depth && matched_depth == depth - 1 && local == steps[depth - 1] {
+                    matched_depth = depth;
+                    if depth == target_depth {
+                        if let Some(attr_name) = attr {
+                            // Extract attribute value
+                            for a in e.attributes().flatten() {
+                                let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
+                                let local_key = key.rsplit(':').next().unwrap_or(key);
+                                if local_key == attr_name {
+                                    if let Ok(val) = std::str::from_utf8(&a.value) {
+                                        values.push(val.to_string());
+                                    }
+                                }
+                            }
+                            if limit.is_some_and(|lim| values.len() >= lim) {
+                                return Some(values);
+                            }
+                        } else {
+                            // Start capturing text content
+                            capturing = true;
+                            captured_text.clear();
+                        }
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                depth += 1;
+                let name_bytes = e.name();
+                let tag = std::str::from_utf8(name_bytes.as_ref()).unwrap_or("");
+                let local = tag.rsplit(':').next().unwrap_or(tag);
+
+                if depth <= target_depth && matched_depth == depth - 1 && local == steps[depth - 1] {
+                    if depth == target_depth {
+                        if let Some(attr_name) = attr {
+                            for a in e.attributes().flatten() {
+                                let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
+                                let local_key = key.rsplit(':').next().unwrap_or(key);
+                                if local_key == attr_name {
+                                    if let Ok(val) = std::str::from_utf8(&a.value) {
+                                        values.push(val.to_string());
+                                    }
+                                }
+                            }
+                            if limit.is_some_and(|lim| values.len() >= lim) {
+                                return Some(values);
+                            }
+                        } else {
+                            // Empty element = empty text
+                            values.push(String::new());
+                            if limit.is_some_and(|lim| values.len() >= lim) {
+                                return Some(values);
+                            }
+                        }
+                    }
+                }
+                depth -= 1;
+            }
+            Ok(Event::Text(ref e)) => {
+                if capturing {
+                    if let Ok(text) = e.unescape() {
+                        captured_text.push_str(&text);
+                    }
+                }
+            }
+            Ok(Event::CData(ref e)) => {
+                if capturing {
+                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
+                        captured_text.push_str(text);
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                if capturing && depth == target_depth {
+                    let trimmed = captured_text.trim().to_string();
+                    values.push(trimmed);
+                    capturing = false;
+                    captured_text.clear();
+                    if limit.is_some_and(|lim| values.len() >= lim) {
+                        return Some(values);
+                    }
+                }
+                if matched_depth >= depth {
+                    matched_depth = depth - 1;
+                }
+                depth -= 1;
             }
             Ok(Event::Eof) => break,
             Err(_) => return None,
@@ -2228,45 +2494,172 @@ fn sort_attributes_recursive(elem: &mut XmlElement) {
 fn xml_tree(xml: &str, max_depth: Option<usize>) -> Result<String, String> {
     let root = parse_xml_tree(xml)?;
     let mut out = String::new();
-    write_tree_node(&root, 0, max_depth, &mut out);
+    write_tree_node_aggregated(&root, 0, max_depth, &mut out);
     Ok(out)
 }
 
-fn write_tree_node(elem: &XmlElement, depth: usize, max_depth: Option<usize>, out: &mut String) {
-    if max_depth.is_some_and(|m| depth > m) {
-        return;
+/// Compute a shape signature for an element: name + sorted attr keys + content flags.
+/// Elements with the same shape are grouped together in the tree view.
+fn element_shape(elem: &XmlElement) -> String {
+    let mut shape = elem.name.clone();
+    if !elem.attributes.is_empty() {
+        let mut keys: Vec<&str> = elem.attributes.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort();
+        shape.push_str(" [");
+        shape.push_str(&keys.iter().map(|k| format!("@{k}")).collect::<Vec<_>>().join(", "));
+        shape.push(']');
     }
+    let has_text = !elem.text_content().is_empty();
+    let has_cdata = elem.children.iter().any(|c| matches!(c, XmlChild::CData(_)));
+    let has_comment = elem.children.iter().any(|c| matches!(c, XmlChild::Comment(_)));
+    let mut content_parts = Vec::new();
+    if has_text { content_parts.push("text"); }
+    if has_cdata { content_parts.push("CDATA"); }
+    if has_comment { content_parts.push("comment"); }
+    if elem.child_element_count() == 0 && !content_parts.is_empty() {
+        shape.push_str(" : ");
+        shape.push_str(&content_parts.join(", "));
+    }
+    // Include child element name pattern to distinguish structurally different elements
+    let child_names: Vec<&str> = elem.child_elements().map(|c| c.name.as_str()).collect();
+    if !child_names.is_empty() {
+        // Deduplicate preserving order for shape comparison
+        let mut seen = Vec::new();
+        for n in &child_names {
+            if !seen.contains(n) { seen.push(n); }
+        }
+        shape.push_str(" {");
+        shape.push_str(&seen.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","));
+        shape.push('}');
+    }
+    shape
+}
 
+/// Format a tree line for an element (without recursion).
+fn format_tree_line(elem: &XmlElement, depth: usize, count: Option<usize>) -> String {
     let indent = "  ".repeat(depth);
-
-    // Element name with attributes summary
     let mut line = format!("{indent}<{}>", elem.name);
+    if let Some(c) = count {
+        if c > 1 {
+            line.push_str(&format!(" x{c}"));
+        }
+    }
     if !elem.attributes.is_empty() {
         let attrs: Vec<_> = elem.attributes.iter().map(|(k, _)| format!("@{k}")).collect();
         line.push_str(&format!(" [{}]", attrs.join(", ")));
     }
-
-    // Check content types
     let has_text = !elem.text_content().is_empty();
     let has_cdata = elem.children.iter().any(|c| matches!(c, XmlChild::CData(_)));
     let has_comment = elem.children.iter().any(|c| matches!(c, XmlChild::Comment(_)));
-    let child_count = elem.child_element_count();
-
     let mut content_parts: Vec<&str> = Vec::new();
     if has_text { content_parts.push("text"); }
     if has_cdata { content_parts.push("CDATA"); }
     if has_comment { content_parts.push("comment"); }
-    if child_count == 0 && !content_parts.is_empty() {
+    if elem.child_element_count() == 0 && !content_parts.is_empty() {
         line.push_str(" : ");
         line.push_str(&content_parts.join(", "));
     }
+    line
+}
 
-    out.push_str(&line);
+fn write_tree_node_aggregated(elem: &XmlElement, depth: usize, max_depth: Option<usize>, out: &mut String) {
+    if max_depth.is_some_and(|m| depth > m) {
+        return;
+    }
+
+    // Write this element's line (root is never aggregated, count=None)
+    out.push_str(&format_tree_line(elem, depth, None));
     out.push('\n');
 
-    // Recurse into children
-    for child in elem.child_elements() {
-        write_tree_node(child, depth + 1, max_depth, out);
+    if max_depth.is_some_and(|m| depth >= m) {
+        return;
+    }
+
+    // Group children by shape, preserving first-appearance order
+    let children: Vec<&XmlElement> = elem.child_elements().collect();
+    if children.is_empty() {
+        return;
+    }
+
+    // Build groups: (shape, representative, count)
+    let mut groups: Vec<(String, &XmlElement, usize)> = Vec::new();
+    let mut shape_index: HashMap<String, usize> = HashMap::new();
+
+    for child in &children {
+        let shape = element_shape(child);
+        if let Some(&idx) = shape_index.get(&shape) {
+            groups[idx].2 += 1;
+        } else {
+            shape_index.insert(shape.clone(), groups.len());
+            groups.push((shape, child, 1));
+        }
+    }
+
+    for (_shape, representative, count) in &groups {
+        if *count > 1 {
+            // Show aggregated line with count, then recurse into representative
+            out.push_str(&format_tree_line(representative, depth + 1, Some(*count)));
+            out.push('\n');
+            // Recurse into the representative's children (one level deeper)
+            if !max_depth.is_some_and(|m| depth + 1 >= m) {
+                let rep_children: Vec<&XmlElement> = representative.child_elements().collect();
+                if !rep_children.is_empty() {
+                    let mut sub_groups: Vec<(String, &XmlElement, usize)> = Vec::new();
+                    let mut sub_index: HashMap<String, usize> = HashMap::new();
+                    for child in &rep_children {
+                        let shape = element_shape(child);
+                        if let Some(&idx) = sub_index.get(&shape) {
+                            sub_groups[idx].2 += 1;
+                        } else {
+                            sub_index.insert(shape.clone(), sub_groups.len());
+                            sub_groups.push((shape, child, 1));
+                        }
+                    }
+                    for (_s, rep, c) in &sub_groups {
+                        write_tree_node_aggregated_inner(rep, depth + 2, max_depth, out, *c);
+                    }
+                }
+            }
+        } else {
+            // Single element: recurse normally
+            write_tree_node_aggregated(representative, depth + 1, max_depth, out);
+        }
+    }
+}
+
+fn write_tree_node_aggregated_inner(elem: &XmlElement, depth: usize, max_depth: Option<usize>, out: &mut String, count: usize) {
+    if max_depth.is_some_and(|m| depth > m) {
+        return;
+    }
+
+    out.push_str(&format_tree_line(elem, depth, if count > 1 { Some(count) } else { None }));
+    out.push('\n');
+
+    if max_depth.is_some_and(|m| depth >= m) {
+        return;
+    }
+
+    // Group this element's children by shape too
+    let children: Vec<&XmlElement> = elem.child_elements().collect();
+    if children.is_empty() {
+        return;
+    }
+
+    let mut groups: Vec<(String, &XmlElement, usize)> = Vec::new();
+    let mut shape_index: HashMap<String, usize> = HashMap::new();
+
+    for child in &children {
+        let shape = element_shape(child);
+        if let Some(&idx) = shape_index.get(&shape) {
+            groups[idx].2 += 1;
+        } else {
+            shape_index.insert(shape.clone(), groups.len());
+            groups.push((shape, child, 1));
+        }
+    }
+
+    for (_shape, representative, c) in &groups {
+        write_tree_node_aggregated_inner(representative, depth + 1, max_depth, out, *c);
     }
 }
 
@@ -2685,7 +3078,8 @@ fn tool_definitions() -> &'static Value {
                         "properties": {
                             "xml_data": { "type": "string", "description": "Inline XML string" },
                             "xml_file": { "type": "string", "description": "Absolute path to XML file" },
-                            "expression": { "type": "string", "description": "XPath expression. Examples: //book/@title, count(//item), //user[@active='true']" }
+                            "expression": { "type": "string", "description": "XPath expression. Examples: //book/@title, count(//item), //user[@active='true']" },
+                            "limit": { "type": "integer", "description": "Maximum number of results to return (default: unlimited)" }
                         },
                         "required": ["expression"]
                     }
@@ -2786,7 +3180,8 @@ fn tool_definitions() -> &'static Value {
                         "type": "object",
                         "properties": {
                             "xml_data": { "type": "string", "description": "Inline XML string" },
-                            "xml_file": { "type": "string", "description": "Absolute path to XML file" }
+                            "xml_file": { "type": "string", "description": "Absolute path to XML file" },
+                            "output_file": { "type": "string", "description": "Write result to file (omit to return inline)" }
                         }
                     }
                 },
@@ -3054,6 +3449,21 @@ fn code_result(text: &str, _lang: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
 }
 
+fn format_streaming_values(values: Vec<String>) -> Value {
+    if values.is_empty() {
+        text_result("0 matches")
+    } else if values.len() == 1 {
+        text_result(&values[0])
+    } else {
+        let mut out = format!("{}\n", values.len());
+        for v in &values {
+            out.push_str(v);
+            out.push('\n');
+        }
+        text_result(out.trim_end())
+    }
+}
+
 fn annotated_result(header: &str, body: &str, _lang: &str) -> Value {
     // Compact format: header on first line, content follows
     let formatted = format!("{header}\n{body}");
@@ -3074,31 +3484,36 @@ fn handle_tool_call(params: &Value) -> Result<Value, String> {
         // --- XPath ---
         "xpath_query" => {
             let xml = load_xml_str(&args, "xml_data", "xml_file")?;
-            let expr = args.get("expression").and_then(|v| v.as_str())
+            let raw_expr = args.get("expression").and_then(|v| v.as_str())
                 .ok_or("Missing 'expression'")?;
+            let expr = &decode_xpath_entities(raw_expr);
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
 
             // Try streaming optimizations first (much faster for large files)
+            // Descendant patterns: count(//elem), //elem/@attr
             if let Some(count) = try_streaming_count(&xml, expr) {
                 return Ok(text_result(&count.to_string()));
             }
-            if let Some(values) = try_streaming_extract(&xml, expr) {
-                if values.is_empty() {
-                    return Ok(text_result("0 matches"));
-                } else if values.len() == 1 {
-                    return Ok(text_result(&values[0]));
-                } else {
-                    let mut out = format!("{}\n", values.len());
-                    for v in &values {
-                        out.push_str(v);
-                        out.push('\n');
-                    }
-                    return Ok(text_result(out.trim_end()));
-                }
+            if let Some(values) = try_streaming_extract(&xml, expr, limit) {
+                return Ok(format_streaming_values(values));
+            }
+            // Absolute path patterns: count(/a/b/c), /a/b/c, /a/b/@attr
+            if let Some(count) = try_streaming_absolute_count(&xml, expr) {
+                return Ok(text_result(&count.to_string()));
+            }
+            if let Some(values) = try_streaming_absolute_extract(&xml, expr, limit) {
+                return Ok(format_streaming_values(values));
             }
 
             // Fall back to full DOM-based XPath evaluation
             let root = parse_xml_tree(&xml)?;
             let (results, _xvalue) = xpath_query_tree(&root, expr)?;
+            // Apply limit to DOM results
+            let results: Vec<_> = if let Some(lim) = limit {
+                results.into_iter().take(lim).collect()
+            } else {
+                results
+            };
             if results.is_empty() {
                 Ok(text_result("0 matches"))
             } else if results.len() == 1 {
@@ -3124,7 +3539,8 @@ fn handle_tool_call(params: &Value) -> Result<Value, String> {
 
         "xpath_set" => {
             let xml = load_xml_str(&args, "xml_data", "xml_file")?;
-            let expr = args.get("expression").and_then(|v| v.as_str()).ok_or("Missing 'expression'")?;
+            let raw_expr = args.get("expression").and_then(|v| v.as_str()).ok_or("Missing 'expression'")?;
+            let expr = &decode_xpath_entities(raw_expr);
             let new_value = args.get("value").and_then(|v| v.as_str()).ok_or("Missing 'value'")?;
             let output_file = args.get("output_file").and_then(|v| v.as_str());
 
@@ -3141,7 +3557,8 @@ fn handle_tool_call(params: &Value) -> Result<Value, String> {
 
         "xpath_delete" => {
             let xml = load_xml_str(&args, "xml_data", "xml_file")?;
-            let expr = args.get("expression").and_then(|v| v.as_str()).ok_or("Missing 'expression'")?;
+            let raw_expr = args.get("expression").and_then(|v| v.as_str()).ok_or("Missing 'expression'")?;
+            let expr = &decode_xpath_entities(raw_expr);
             let output_file = args.get("output_file").and_then(|v| v.as_str());
 
             let mut root = parse_xml_tree(&xml)?;
@@ -3157,7 +3574,8 @@ fn handle_tool_call(params: &Value) -> Result<Value, String> {
 
         "xpath_add" => {
             let xml = load_xml_str(&args, "xml_data", "xml_file")?;
-            let expr = args.get("expression").and_then(|v| v.as_str()).ok_or("Missing 'expression'")?;
+            let raw_expr = args.get("expression").and_then(|v| v.as_str()).ok_or("Missing 'expression'")?;
+            let expr = &decode_xpath_entities(raw_expr);
             let content = args.get("content").and_then(|v| v.as_str()).ok_or("Missing 'content'")?;
             let position = args.get("position").and_then(|v| v.as_str()).unwrap_or("inside");
             let output_file = args.get("output_file").and_then(|v| v.as_str());
@@ -3176,7 +3594,9 @@ fn handle_tool_call(params: &Value) -> Result<Value, String> {
         // --- Conversion ---
         "xml_to_json" => {
             let xml = load_xml_str(&args, "xml_data", "xml_file")?;
-            xml_to_json_string(&xml).map(|s| code_result(&s, "json"))
+            let output_file = args.get("output_file").and_then(|v| v.as_str());
+            let json = xml_to_json_string(&xml)?;
+            Ok(write_result_to_value(maybe_write_file(json, output_file)?, "json"))
         }
 
         "json_to_xml" => {
