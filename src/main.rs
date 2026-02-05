@@ -669,6 +669,7 @@ struct WsdlEndpoint {
     name: String,
     binding: String,
     location: String,
+    soap_version: String,
 }
 
 struct WsdlTypeInfo {
@@ -677,6 +678,7 @@ struct WsdlTypeInfo {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 struct WsdlField {
     name: String,
     type_name: String,
@@ -722,9 +724,19 @@ fn parse_wsdl_operations(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> Vec
         }
     }
 
-    // Find binding operations for SOAPAction and style
-    for binding in find_children_ns(root, WSDL11_NS, "binding", ns_map) {
-        // Detect SOAP binding style
+    // Find binding operations for SOAPAction and style (use first SOAP binding only)
+    if let Some(binding) = find_children_ns(root, WSDL11_NS, "binding", ns_map)
+        .into_iter()
+        .find(|b| {
+            b.child_elements().any(|c| {
+                let local = local_name_of(&c.name);
+                local == "binding" && {
+                    let prefix = if let Some(idx) = c.name.find(':') { &c.name[..idx] } else { "" };
+                    ns_map.get(prefix).is_some_and(|&uri| uri == SOAP11_BIND || uri == SOAP12_BIND)
+                }
+            })
+        })
+    {
         let binding_style = binding.child_elements()
             .find(|c| {
                 let local = local_name_of(&c.name);
@@ -775,20 +787,38 @@ fn parse_wsdl_operations(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> Vec
 }
 
 fn parse_wsdl_endpoints(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> Vec<WsdlEndpoint> {
+    // Build binding name → SOAP version map
+    let mut binding_versions: HashMap<String, String> = HashMap::new();
+    for binding in find_children_ns(root, WSDL11_NS, "binding", ns_map) {
+        let bname = binding.get_attribute("name").unwrap_or("").to_string();
+        let version = binding.child_elements()
+            .find(|c| local_name_of(&c.name) == "binding")
+            .map(|c| {
+                let prefix = if let Some(idx) = c.name.find(':') { &c.name[..idx] } else { "" };
+                match ns_map.get(prefix).copied() {
+                    Some(SOAP12_BIND) => "1.2".to_string(),
+                    Some(SOAP11_BIND) => "1.1".to_string(),
+                    _ => "1.1".to_string(),
+                }
+            })
+            .unwrap_or_else(|| "1.1".to_string());
+        binding_versions.insert(bname, version);
+    }
+
     let mut endpoints = Vec::new();
     for svc in find_children_ns(root, WSDL11_NS, "service", ns_map) {
         for port in find_children_ns(svc, WSDL11_NS, "port", ns_map) {
             let name = port.get_attribute("name").unwrap_or("").to_string();
             let binding = strip_ns_prefix(port.get_attribute("binding").unwrap_or(""));
             let location = port.child_elements()
-                .find(|c| {
-                    let local = local_name_of(&c.name);
-                    local == "address"
-                })
+                .find(|c| local_name_of(&c.name) == "address")
                 .and_then(|c| c.get_attribute("location"))
                 .unwrap_or("")
                 .to_string();
-            endpoints.push(WsdlEndpoint { name, binding, location });
+            let soap_version = binding_versions.get(&binding)
+                .cloned()
+                .unwrap_or_else(|| "1.1".to_string());
+            endpoints.push(WsdlEndpoint { name, binding, location, soap_version });
         }
     }
     endpoints
@@ -814,25 +844,35 @@ fn parse_wsdl_types(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> Vec<Wsdl
             merged.insert(k, v);
         }
 
-        // Find elements and complexTypes
+        // First pass: collect complexTypes by name
+        let mut complex_types: HashMap<String, Vec<WsdlField>> = HashMap::new();
         for child in schema_el.child_elements() {
-            let child_local = local_name_of(&child.name);
-            match child_local {
-                "element" => {
-                    let el_name = child.get_attribute("name").unwrap_or("").to_string();
+            if local_name_of(&child.name) == "complexType" {
+                let ct_name = child.get_attribute("name").unwrap_or("").to_string();
+                if !ct_name.is_empty() {
                     let fields = extract_xsd_fields(child, &merged);
-                    if !el_name.is_empty() {
-                        types.push(WsdlTypeInfo { name: el_name, fields });
+                    complex_types.insert(ct_name.clone(), fields.clone());
+                    types.push(WsdlTypeInfo { name: ct_name, fields });
+                }
+            }
+        }
+
+        // Second pass: collect elements (resolve type references to complexTypes)
+        for child in schema_el.child_elements() {
+            if local_name_of(&child.name) == "element" {
+                let el_name = child.get_attribute("name").unwrap_or("").to_string();
+                if el_name.is_empty() { continue; }
+                let mut fields = extract_xsd_fields(child, &merged);
+                // If element has no inline fields but references a complexType, resolve it
+                if fields.is_empty() {
+                    if let Some(type_ref) = child.get_attribute("type") {
+                        let local_ref = strip_ns_prefix(type_ref);
+                        if let Some(ct_fields) = complex_types.get(&local_ref) {
+                            fields = ct_fields.clone();
+                        }
                     }
                 }
-                "complexType" => {
-                    let ct_name = child.get_attribute("name").unwrap_or("").to_string();
-                    let fields = extract_xsd_fields(child, &merged);
-                    if !ct_name.is_empty() {
-                        types.push(WsdlTypeInfo { name: ct_name, fields });
-                    }
-                }
-                _ => {}
+                types.push(WsdlTypeInfo { name: el_name, fields });
             }
         }
     }
@@ -979,8 +1019,6 @@ fn wsdl_inspect(xml: &str) -> Result<String, String> {
     let binding_use = detect_binding_use(&root, &ns_map);
 
     // Detect SOAP version from binding namespace
-    let soap_version = detect_wsdl_soap_version(&root, &ns_map);
-
     let mut out = String::with_capacity(1024);
     out.push_str(&format!("WSDL: {service_name}\n"));
     out.push_str(&format!("Target namespace: {target_ns}\n"));
@@ -1012,7 +1050,7 @@ fn wsdl_inspect(xml: &str) -> Result<String, String> {
         out.push_str(&format!("\nEndpoints:\n"));
         for ep in &endpoints {
             out.push_str(&format!("  - {} -> {}\n", ep.name, ep.location));
-            out.push_str(&format!("    Binding: {} (SOAP {})\n", ep.binding, soap_version));
+            out.push_str(&format!("    Binding: {} (SOAP {})\n", ep.binding, ep.soap_version));
         }
     }
 
@@ -1064,25 +1102,6 @@ fn detect_binding_use(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> &'stat
     "literal"
 }
 
-fn detect_wsdl_soap_version(root: &XmlElement, ns_map: &HashMap<&str, &str>) -> &'static str {
-    for binding in find_children_ns(root, WSDL11_NS, "binding", ns_map) {
-        for child in binding.child_elements() {
-            let local = local_name_of(&child.name);
-            if local == "binding" {
-                let prefix = if let Some(idx) = child.name.find(':') { &child.name[..idx] } else { "" };
-                if let Some(&uri) = ns_map.get(prefix) {
-                    if uri == SOAP12_BIND {
-                        return "1.2";
-                    }
-                    if uri == SOAP11_BIND {
-                        return "1.1";
-                    }
-                }
-            }
-        }
-    }
-    "1.1"
-}
 
 // ---------------------------------------------------------------------------
 // XML parsing — quick-xml events → tree
